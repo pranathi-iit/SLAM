@@ -1,0 +1,947 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from pathlib import Path
+
+# Install snntorch if not already installed
+try:
+    import snntorch as snn
+    from snntorch import surrogate
+except ImportError:
+    print("Installing snntorch...")
+    !pip install snntorch
+    import snntorch as snn
+    from snntorch import surrogate
+
+GRAVITY   = 9.81
+DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[SNN]   Running on: {DEVICE}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Quaternion utilities  [w, x, y, z]
+# ═══════════════════════════════════════════════════════════════════════════
+
+def qmult(q, r):
+    w0,x0,y0,z0 = q; w1,x1,y1,z1 = r
+    return np.array([
+        w0*w1-x0*x1-y0*y1-z0*z1,
+        w0*x1+x0*w1+y0*z1-z0*y1,
+        w0*y1-x0*z1+y0*w1+z0*x1,
+        w0*z1+x0*y1-y0*x1+z0*w1])
+
+def qconj(q): return np.array([q[0],-q[1],-q[2],-q[3]])
+def qnorm(q): n=np.linalg.norm(q); return q/n if n>1e-12 else q
+
+def qrot(q, v):
+    return qmult(qmult(q,[0,v[0],v[1],v[2]]),qconj(q))[1:]
+
+def quat_to_euler(q):
+    w,x,y,z = q
+    roll  = np.arctan2(2*(w*x+y*z), 1-2*(x*x+y*y))
+    pitch = np.arcsin(np.clip(2*(w*y-z*x),-1,1))
+    yaw   = np.arctan2(2*(w*z+x*y), 1-2*(y*y+z*z))
+    return np.array([roll,pitch,yaw])
+
+def euler_to_rot(roll,pitch,yaw):
+    cr,sr=np.cos(roll),np.sin(roll)
+    cp,sp=np.cos(pitch),np.sin(pitch)
+    cy,sy=np.cos(yaw),np.sin(yaw)
+    Rx=np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
+    Ry=np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
+    Rz=np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
+    return Rz@Ry@Rx
+
+def skew(v):
+    return np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
+
+def gravity_alignment_euler(accel_mean):
+    g = np.linalg.norm(accel_mean)
+    roll  = np.arctan2(accel_mean[1], accel_mean[2])
+    pitch = np.arctan2(-accel_mean[0],
+                       np.sqrt(accel_mean[1]**2+accel_mean[2]**2))
+    return np.array([roll,pitch,0.0]), g
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Spike Encoding  (Rate + Delta coding)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SpikeEncoder:
+    """
+    Converts raw IMU readings to spike trains for the SNN input layer.
+
+    Two encoding schemes run in parallel:
+      Rate coding  : P(spike) ∝ |signal| — encodes magnitude
+      Delta coding : spike if |Δsignal| > threshold — encodes change events
+
+    This mirrors biological mechanoreceptors and semicircular canals.
+    """
+
+    def __init__(self, n_steps=8, rate_scale=10.0, delta_thresh=0.01):
+        """
+        n_steps     : number of spike time-steps per IMU sample (temporal resolution)
+        rate_scale  : maps signal magnitude → firing probability
+        delta_thresh: minimum change to generate a delta spike
+        """
+        self.n_steps     = n_steps
+        self.rate_scale  = rate_scale
+        self.delta_thresh= delta_thresh
+        self._prev       = np.zeros(6)   # previous [gyro(3), accel(3)]
+
+    def encode(self, imu_6d):
+        """
+        imu_6d : np.array shape (6,) — [gx,gy,gz, ax,ay,az]
+        Returns : torch.Tensor shape (n_steps, 12)
+                  channels: rate_pos(6) + delta_signed(6)
+        """
+        # ── Rate coding: positive and negative separately ──────────────────
+        # Normalise by expected ranges: gyro ~1 rad/s, accel ~10 m/s²
+        scale  = np.array([1.0,1.0,1.0, 10.0,10.0,10.0])
+        normed = np.clip(np.abs(imu_6d) / scale, 0, 1)
+
+        # Poisson spike generation over n_steps time bins
+        rand        = np.random.rand(self.n_steps, 6)
+        rate_spikes = (rand < normed[None,:] * self.rate_scale
+                            / self.n_steps).astype(np.float32)
+
+        # ── Delta coding: detect significant changes ───────────────────────
+        delta = imu_6d - self._prev
+        self._prev = imu_6d.copy()
+
+        # Sign-coded delta spike: positive channel fires for +Δ, negative for -Δ
+        delta_spikes = np.zeros((self.n_steps, 6), dtype=np.float32)
+        for j in range(6):
+            if abs(delta[j]) > self.delta_thresh:
+                # Distribute spike over proportional number of steps
+                n_fire = min(self.n_steps,
+                             int(abs(delta[j])/self.delta_thresh))
+                sign   = np.sign(delta[j])
+                fire_steps = np.random.choice(self.n_steps, n_fire,
+                                              replace=False)
+                delta_spikes[fire_steps, j] = sign
+
+        spikes = np.concatenate([rate_spikes, delta_spikes], axis=1)  # (T, 12)
+        return torch.tensor(spikes, dtype=torch.float32, device=DEVICE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SNN Architecture  — 3-layer LIF network with recurrent connections
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SNNNavigator(nn.Module):
+    """
+    Spiking Neural Network for IMU-based navigation state estimation.
+
+    Layer 1  — Sensory: 12 → 128 LIF neurons
+      Encodes basic sensory features. Fast decay (β=0.95) for quick response.
+
+    Layer 2  — Memory:  128 → 256 Recurrent LIF neurons
+      Recurrent connections create temporal memory across samples.
+      Slower decay (β=0.98) preserves integration history.
+      This is the SNN analogue of the EKF's state covariance memory.
+
+    Layer 3  — Navigation: 256 → 128 LIF neurons
+      Integrates sensory + memory features. Medium decay (β=0.90).
+
+    Output   — Linear decode: 128 → 9
+      Maps spike rates to navigation increments:
+        [Δvx, Δvy, Δvz,   velocity increments
+         Δroll, Δpitch, Δyaw,  attitude increments
+         confidence_x, confidence_y, confidence_z]  (uncertainty proxy)
+
+    Surrogate gradient: arctangent (atan) for backpropagation through spikes.
+    """
+
+    def __init__(self, n_input=12, n_hidden1=128, n_hidden2=256,
+                 n_hidden3=128, n_output=9):
+        super().__init__()
+
+        # Surrogate gradient function for spike backprop
+        spike_grad = surrogate.atan(alpha=2.0)
+
+        # ── Layer 1: Sensory ─────────────────────────────────────────────
+        self.fc1   = nn.Linear(n_input, n_hidden1, bias=True)
+        self.lif1  = snn.Leaky(beta=0.95, spike_grad=spike_grad,
+                                threshold=0.5, learn_beta=True,
+                                learn_threshold=True)
+
+        # ── Layer 2: Recurrent Memory ─────────────────────────────────────
+        self.fc2   = nn.Linear(n_hidden1, n_hidden2, bias=True)
+        self.rfc2  = nn.Linear(n_hidden2, n_hidden2, bias=False)  # recurrent
+        self.lif2  = snn.Leaky(beta=0.98, spike_grad=spike_grad,
+                                threshold=0.5, learn_beta=True,
+                                learn_threshold=True)
+
+        # ── Layer 3: Navigation ───────────────────────────────────────────
+        self.fc3   = nn.Linear(n_hidden2, n_hidden3, bias=True)
+        self.lif3  = snn.Leaky(beta=0.90, spike_grad=spike_grad,
+                                threshold=0.5, learn_beta=True,
+                                learn_threshold=True)
+
+        # ── Output: linear decode from spike rates ─────────────────────────
+        self.fc_out = nn.Linear(n_hidden3, n_output, bias=True)
+
+        # Initialise with small weights for numerical stability
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.3)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, spike_input, mem1, mem2, spk2_prev, mem3):
+        """
+        spike_input : (T, batch, 12) — encoded IMU spike train
+        Returns     : (output_9, new_mem1, new_mem2, new_spk2, new_mem3,
+                       spike_counts_layer2)
+        """
+        T = spike_input.shape[0]
+        spk2_acc  = None    # will be initialised on first spike
+
+        for t in range(T):
+            x = spike_input[t]                    # (batch, 12)
+
+            # Layer 1
+            cur1      = self.fc1(x)
+            spk1, mem1 = self.lif1(cur1, mem1)
+
+            # Layer 2 (recurrent)
+            cur2      = self.fc2(spk1) + self.rfc2(spk2_prev)
+            spk2, mem2 = self.lif2(cur2, mem2)
+            spk2_prev  = spk2
+            if spk2_acc is None:
+                spk2_acc = torch.zeros_like(spk2)
+            spk2_acc  += spk2
+
+            # Layer 3
+            cur3      = self.fc3(spk2)
+            spk3, mem3 = self.lif3(cur3, mem3)
+
+        # Decode: spike rate (accumulated / T) → navigation state
+        rate3  = spk3                              # last timestep rate
+        output = self.fc_out(rate3)                # (batch, 9)
+
+        if spk2_acc is None:
+            spk2_acc = torch.zeros(spk2.shape, device=DEVICE)
+        return output, mem1, mem2, spk2_prev, mem3, spk2_acc/T
+
+    def init_hidden(self, batch_size=1):
+        """
+        Initialise membrane potentials and recurrent spikes to zero.
+        """
+        def _z(n): return torch.zeros(batch_size, n, device=DEVICE)
+        mem1 = self.lif1.init_leaky()
+        mem2 = self.lif2.init_leaky()
+        spk2 = _z(self.fc2.out_features)
+        mem3 = self.lif3.init_leaky()
+        return mem1, mem2, spk2, mem3
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Homeostatic Bias Estimator  (spike-rate adaptation)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HomeostaticBiasEstimator:
+    """
+    Estimates IMU bias through spike-rate adaptation — a biologically
+    motivated mechanism where neurons down-regulate when over-stimulated.
+
+    In biology: neurons reduce firing rate when persistently activated.
+    Here:       if the SNN output consistently predicts motion when the
+                platform is static (detected by ZUPT), the bias is adapted
+                to cancel the offset.
+
+    This replaces the EKF's algebraic bias random-walk states.
+    """
+
+    def __init__(self, lr=0.001, momentum=0.95):
+        self.gyro_bias  = np.zeros(3)
+        self.accel_bias = np.zeros(3)
+        self._gvel      = np.zeros(3)   # momentum buffer gyro
+        self._avel      = np.zeros(3)   # momentum buffer accel
+        self.lr         = lr
+        self.momentum   = momentum
+
+    def update(self, gyro_raw, accel_raw, is_static, vel_predicted):
+        """
+        When static (ZUPT), any predicted velocity is due to bias.
+        Update biases via SGD-with-momentum on the velocity residual.
+        """
+        if is_static and np.linalg.norm(vel_predicted) > 0.005:
+            # Gyro bias: drives attitude error → fake accel → fake velocity
+            grad_g = gyro_raw * np.linalg.norm(vel_predicted)
+            self._gvel = self.momentum*self._gvel + (1-self.momentum)*grad_g
+            self.gyro_bias += self.lr * self._gvel
+
+            # Accel bias: directly drives velocity error
+            grad_a = vel_predicted * 0.5
+            self._avel = self.momentum*self._avel + (1-self.momentum)*grad_a
+            self.accel_bias += self.lr * self._avel
+
+        return self.gyro_bias, self.accel_bias
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Spike-Pattern Loop Closure Detector
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SpikePatternLoopClosure:
+    """
+    Detects loop closures by comparing SNN layer-2 population spike patterns.
+
+    Key insight: the SNN's recurrent layer-2 develops place-cell-like
+    activity — similar locations produce similar spike patterns.
+    This is analogous to hippocampal place cells in biological navigation.
+
+    Similarity metric: cosine distance on spike rate vectors.
+    If similarity > threshold AND positions are spatially plausible →
+    loop closure event.
+
+    In production this would use:
+      • Visual SNN: event camera → SNN → spike-pattern matching (NeuroSLAM)
+      • LiDAR SNN: point cloud → spiking convolution → descriptor matching
+    """
+
+    def __init__(self, sim_threshold=0.88, min_gap=5.0,
+                 kf_interval=0.5, spatial_radius=3.0):
+        self.sim_threshold  = sim_threshold
+        self.min_gap        = min_gap
+        self.kf_interval    = kf_interval
+        self.spatial_radius = spatial_radius
+        self._keyframes     = []    # (time, pos, spike_pattern)
+        self._last_kf_t     = -np.inf
+        self.events         = []
+
+    def add_keyframe(self, t, pos, spike_pattern):
+        if t - self._last_kf_t >= self.kf_interval:
+            self._keyframes.append((t, pos.copy(),
+                                    spike_pattern.cpu().numpy().flatten()))
+            self._last_kf_t = t
+
+    def detect(self, t, pos, spike_pattern):
+        sp_vec = spike_pattern.cpu().numpy().flatten()
+        sp_n   = np.linalg.norm(sp_vec)
+        if sp_n < 1e-6:
+            return None
+
+        for (kt, kp, ksp) in self._keyframes:
+            if t - kt < self.min_gap:
+                continue
+            if np.linalg.norm(pos - kp) > self.spatial_radius * 3:
+                continue  # spatial pre-filter (fast reject)
+
+            ksp_n = np.linalg.norm(ksp)
+            if ksp_n < 1e-6:
+                continue
+
+            cosine_sim = np.dot(sp_vec, ksp) / (sp_n * ksp_n)
+
+            if (cosine_sim > self.sim_threshold and
+                    np.linalg.norm(pos - kp) < self.spatial_radius):
+                self.events.append({
+                    "t": t, "pos": pos.copy(), "kf_pos": kp.copy(),
+                    "similarity": float(cosine_sim)
+                })
+                return kp, float(cosine_sim)
+
+        return None
+
+    @property
+    def keyframes(self):
+        return [(t, p) for t,p,_ in self._keyframes]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ZUPT Detector
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ZUPTDetector:
+    """
+    Gyro-RMS gating. When static, spike encoder output is suppressed
+    (no delta spikes, rate spikes near zero) — the SNN naturally silences.
+    We additionally force velocity to zero.
+    """
+    def __init__(self, window=15, thresh=0.04):
+        self.window=window; self.thresh=thresh; self._buf=[]
+
+    def update(self, gx, gy, gz):
+        self._buf.append(gx**2+gy**2+gz**2)
+        if len(self._buf)>self.window: self._buf.pop(0)
+        return np.sqrt(np.mean(self._buf)) < self.thresh
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SNN Training on Static Window  (online self-supervised initialisation)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def pretrain_snn_static(snn_model, encoder, static_data, n_epochs=30):
+    """
+    Self-supervised pretraining: teach the SNN that static IMU data
+    should produce zero velocity output.
+
+    This is equivalent to the EKF's initial bias estimation + zero-velocity
+    constraint, but learned end-to-end through spike-backpropagation.
+
+    Loss: MSE( SNN_velocity_output, 0 )
+    """
+    optimizer = torch.optim.Adam(snn_model.parameters(), lr=3e-3,
+                                 weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-4)
+
+    snn_model.train()
+    losses = []
+
+    for epoch in range(n_epochs):
+        epoch_loss = 0.0
+        mem1,mem2,spk2,mem3 = snn_model.init_hidden(1)
+
+        for row in static_data:
+            imu_6d = row[1:7]
+            spikes = encoder.encode(imu_6d).unsqueeze(1)   # (T,1,12)
+
+            optimizer.zero_grad()
+            out,mem1,mem2,spk2,mem3,_ = snn_model(
+                spikes,
+                mem1.detach(), mem2.detach(),
+                spk2.detach(), mem3.detach())
+
+            # Target: zero velocity (first 3 outputs)
+            target = torch.zeros(1, 9, device=DEVICE)
+            loss   = nn.MSELoss()(out[:, :3], target[:, :3])
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(snn_model.parameters(), 0.5)
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        scheduler.step()
+        avg = epoch_loss / len(static_data)
+        losses.append(avg)
+        if (epoch+1) % 10 == 0:
+            print(f"  [PRETRAIN] Epoch {epoch+1:3d}/{n_epochs}  loss={avg:.6f}")
+
+    snn_model.eval()
+    return losses
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main SNN-SLAM Pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_snn_slam(data,
+                 n_static        = 200,
+                 zupt_thresh     = 0.04,
+                 zupt_win        = 15,
+                 n_steps         = 8,
+                 pretrain_epochs = 30,
+                 velocity_scale  = 0.1,
+                 attitude_scale  = 0.02,
+                 lc_sim_thresh   = 0.88,
+                 lc_min_gap      = 5.0,
+                 lc_radius       = 3.0,
+                 seed            = 42):
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    N   = len(data)
+    ts  = data[:,0]
+
+    # ── Static initialisation ────────────────────────────────────────────────
+    static_data  = data[:n_static]
+    gyro_bias0   = static_data[:,1:4].mean(axis=0)
+    accel_mean0  = static_data[:,4:7].mean(axis=0)
+    euler0, g_mag = gravity_alignment_euler(accel_mean0)
+    accel_bias0  = accel_mean0 - g_mag * np.array([
+        -np.sin(euler0[1]),
+         np.cos(euler0[1])*np.sin(euler0[0]),
+         np.cos(euler0[1])*np.cos(euler0[0])])
+
+    print(f"[INIT]  Gyro bias   : {gyro_bias0}")
+    print(f"[INIT]  Euler (°)   : Roll={np.degrees(euler0[0]):.2f} "
+          f"Pitch={np.degrees(euler0[1]):.2f}")
+    print(f"[INIT]  g_mag       : {g_mag:.4f} m/s²")
+
+    # ── Build SNN ────────────────────────────────────────────────────────────
+    print("\n[SNN]   Building network...")
+    encoder  = SpikeEncoder(n_steps=n_steps, rate_scale=8.0, delta_thresh=0.008)
+    snn_model = SNNNavigator(
+        n_input=12, n_hidden1=128, n_hidden2=256,
+        n_hidden3=128, n_output=9).to(DEVICE)
+
+    n_params = sum(p.numel() for p in snn_model.parameters())
+    print(f"[SNN]   Parameters  : {n_params:,}")
+    print(f"[SNN]   Timesteps   : {n_steps} per IMU sample")
+
+    # ── Pre-train on static window ────────────────────────────────────────────
+    print(f"\n[PRETRAIN] Self-supervised on {n_static} static samples...")
+    pretrain_losses = pretrain_snn_static(
+        snn_model, encoder, static_data, n_epochs=pretrain_epochs)
+
+    # ── Sub-systems ───────────────────────────────────────────────────────────
+    bias_est = HomeostaticBiasEstimator(lr=0.0005, momentum=0.92)
+    bias_est.gyro_bias  = gyro_bias0.copy()
+    bias_est.accel_bias = accel_bias0.copy()
+
+    zupt = ZUPTDetector(window=zupt_win, thresh=zupt_thresh)
+    lcd  = SpikePatternLoopClosure(
+        sim_threshold=lc_sim_thresh, min_gap=lc_min_gap,
+        kf_interval=0.5, spatial_radius=lc_radius)
+
+    # ── Output buffers ────────────────────────────────────────────────────────
+    pos_h     = np.zeros((N, 3))
+    vel_h     = np.zeros((N, 3))
+    euler_h   = np.zeros((N, 3))
+    gbias_h   = np.zeros((N, 3))
+    abias_h   = np.zeros((N, 3))
+    spike_rate_h = np.zeros((N, 256))   # layer-2 spike rates
+    fire_rate_h  = np.zeros(N)          # mean firing rate
+    zupt_h    = np.zeros(N, dtype=bool)
+    lc_h      = np.zeros(N, dtype=bool)
+    lc_sim_h  = np.zeros(N)
+
+    pos   = np.zeros(3)
+    vel   = np.zeros(3)
+    euler = euler0.copy()
+
+    # SNN hidden state — preserved across samples (stateful temporal memory)
+    snn_model.eval()
+    with torch.no_grad():
+        mem1,mem2,spk2,mem3 = snn_model.init_hidden(1)
+
+    n_lc = 0
+    g_world = np.array([0., 0., g_mag])
+
+    print(f"\n[RUN]   Processing {N} samples...")
+
+    with torch.no_grad():
+        for i in range(N):
+            dt = float(ts[i]-ts[i-1]) if i>0 else 0.005
+            dt = np.clip(dt, 1e-4, 0.05)
+
+            gyro_raw  = data[i,1:4]
+            accel_raw = data[i,4:7]
+
+            # Subtract estimated biases
+            gyro_c  = gyro_raw  - bias_est.gyro_bias
+            accel_c = accel_raw - bias_est.accel_bias
+
+            # ── 1. Spike encoding ──────────────────────────────────────────
+            imu_6d = np.concatenate([gyro_c, accel_c])
+            spikes = encoder.encode(imu_6d).unsqueeze(1)   # (T,1,12)
+
+            # ── 2. SNN forward pass ────────────────────────────────────────
+            out,mem1,mem2,spk2,mem3,spk2_rate = snn_model(
+                spikes, mem1, mem2, spk2, mem3)
+
+            # ── 3. Decode SNN output → navigation increments ───────────────
+            out_np = out[0].cpu().numpy()   # (9,)
+
+            delta_vel = out_np[0:3] * velocity_scale   # Δv  (m/s)
+            delta_att = out_np[3:6] * attitude_scale   # Δeuler (rad)
+            confidence= np.abs(out_np[6:9])             # uncertainty proxy
+
+            # ── 4. ZUPT gating — suppress velocity if static ───────────────
+            is_static = zupt.update(*gyro_c)
+            zupt_h[i] = is_static
+            if is_static:
+                # Force velocity to zero AND suppress SNN velocity output
+                vel   = np.zeros(3)
+                delta_vel = np.zeros(3)
+                # Membrane reset clamp — reduce integration in static phase
+                mem2 = mem2 * 0.5   # partial reset = biological adaptation
+
+            # ── 5. State integration ──────────────────────────────────────
+            # Attitude update from SNN delta
+            euler = euler + delta_att * dt * 20   # scale by dt and gain
+            euler[1] = np.clip(euler[1], -np.pi/2+0.01, np.pi/2-0.01)
+            euler = (euler + np.pi) % (2*np.pi) - np.pi
+
+            # Velocity update: SNN delta + physics correction
+            R       = euler_to_rot(*euler)
+            a_world = R @ accel_c - g_world
+            vel     = vel + delta_vel + a_world * dt * 0.3   # blended
+
+            # Position integration
+            pos = pos + vel * dt
+
+            # ── 6. Homeostatic bias update ─────────────────────────────────
+            gb, ab = bias_est.update(gyro_raw, accel_raw, is_static, vel)
+
+            # ── 7. Loop closure via spike-pattern similarity ───────────────
+            sp_pattern = spk2_rate[0].unsqueeze(0)   # (1, 256)
+            t_rel = float(ts[i] - ts[0])
+
+            lcd.add_keyframe(t_rel, pos, sp_pattern)
+            lc_result = lcd.detect(t_rel, pos, sp_pattern)
+
+            if lc_result is not None:
+                kf_pos, sim_score = lc_result
+                # Soft position correction weighted by cosine similarity
+                alpha = (sim_score - lc_sim_thresh) / (1.0 - lc_sim_thresh)
+                alpha = np.clip(alpha, 0, 0.6)
+                pos   = pos + alpha * (kf_pos - pos)
+                lc_h[i]  = True
+                lc_sim_h[i] = sim_score
+                n_lc += 1
+
+            # ── 8. Record ──────────────────────────────────────────────────
+            pos_h[i]          = pos
+            vel_h[i]          = vel
+            euler_h[i]        = euler
+            gbias_h[i]        = gb
+            abias_h[i]        = ab
+            spike_rate_h[i]   = spk2_rate[0].cpu().numpy()
+            fire_rate_h[i]    = float(spk2_rate.mean())
+
+    n_zupt = zupt_h.sum()
+    print(f"\n[DONE]  {N} samples | {ts[-1]-ts[0]:.2f} s")
+    print(f"[ZUPT]  Static frames: {n_zupt}/{N}  ({100*n_zupt/N:.1f}%)")
+    print(f"[SNN]   Mean firing rate: {fire_rate_h.mean()*100:.1f}%")
+    print(f"[KF]    Keyframes stored: {len(lcd.keyframes)}")
+    print(f"[LC]    Loop closures   : {n_lc}")
+    print(f"[TRAJ]  Final pos (m): X={pos_h[-1,0]:.3f} "
+          f"Y={pos_h[-1,1]:.3f} Z={pos_h[-1,2]:.3f}")
+
+    return dict(
+        ts=ts, pos=pos_h, vel=vel_h, euler=euler_h,
+        gbias=gbias_h, abias=abias_h,
+        spike_rate=spike_rate_h, fire_rate=fire_rate_h,
+        zupt=zupt_h, lc=lc_h, lc_sim=lc_sim_h,
+        raw=data, keyframes=lcd.keyframes,
+        lc_events=lcd.events,
+        pretrain_losses=pretrain_losses,
+        n_params=n_params
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Visualisation — 16-panel SNN dashboard
+# ═══════════════════════════════════════════════════════════════════════════
+
+def plot_snn(res, save_path=None):
+    ts    = res["ts"] - res["ts"][0]
+    pos   = res["pos"]; vel = res["vel"]
+    euler = res["euler"]
+    roll  = np.degrees(euler[:,0])
+    pitch = np.degrees(euler[:,1])
+    yaw   = np.degrees(euler[:,2])
+    gbias = res["gbias"]; abias = res["abias"]
+    fr    = res["fire_rate"]
+    sr    = res["spike_rate"]
+    zupt  = res["zupt"]; lc = res["lc"]; lc_sim = res["lc_sim"]
+    raw   = res["raw"]; kfs = res["keyframes"]
+    vmag  = np.linalg.norm(vel, axis=1)
+    amag  = np.linalg.norm(raw[:,4:7], axis=1)
+    gm    = np.linalg.norm(raw[:,1:4], axis=1)
+    ptloss= res["pretrain_losses"]
+
+    plt.rcParams.update({
+        "figure.facecolor":"#05070e","axes.facecolor":"#0a0d18",
+        "axes.edgecolor":"#1a1f30","axes.labelcolor":"#a8b4cc",
+        "xtick.color":"#404870","ytick.color":"#404870",
+        "text.color":"#a8b4cc","grid.color":"#101420",
+        "grid.linewidth":0.4,"lines.linewidth":1.2,
+        "font.family":"monospace","font.size":7.5,
+    })
+
+    C = dict(x="#00d8ff",y="#39ff14",z="#ff8c42",
+             mag="#ffd700",zu="#80ff80",lc="#ff44cc",
+             sp="#5b9dff",err="#ff3050",spk="#cc88ff",
+             kf="#ffffff",bio="#44ffcc")
+
+    fig = plt.figure(figsize=(28,20))
+    fig.suptitle(
+        "IMU SNN-SLAM  —  Spiking Neural Network Navigation  "
+        "(LIF Neurons · Rate+Delta Coding · Spike-Pattern Loop Closure)",
+        fontsize=15, fontweight="bold", color="#dde2f4", y=0.99)
+    gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.55, wspace=0.38)
+
+    def mkax(r, c, title, proj=None):
+        a = (fig.add_subplot(gs[r,c], projection=proj) if proj
+             else fig.add_subplot(gs[r,c]))
+        a.set_title(title, color="#4a6888", fontsize=7.5, pad=3)
+        if not proj: a.grid(True, alpha=0.3)
+        return a
+
+    lc_idx = np.where(lc)[0]
+
+    # ── Row 0  Raw + SNN diagnostics ─────────────────────────────────────────
+    a00 = mkax(0,0,"Raw IMU — Gyroscope  (rad/s)")
+    a00.plot(ts,raw[:,1],C["x"],label="ωx",alpha=.8)
+    a00.plot(ts,raw[:,2],C["y"],label="ωy",alpha=.8)
+    a00.plot(ts,raw[:,3],C["z"],label="ωz",alpha=.8)
+    a00.legend(fontsize=6); a00.set_xlabel("t(s)")
+
+    a01 = mkax(0,1,"Raw IMU — Accelerometer  (m/s²)")
+    a01.plot(ts,raw[:,4],C["x"],label="ax",alpha=.8)
+    a01.plot(ts,raw[:,5],C["y"],label="ay",alpha=.8)
+    a01.plot(ts,raw[:,6],C["z"],label="az",alpha=.8)
+    a01.legend(fontsize=6); a01.set_xlabel("t(s)")
+
+    a02 = mkax(0,2,"SNN Layer-2 Mean Firing Rate")
+    a02.plot(ts, fr*100, color=C["spk"], lw=1.2, label="mean firing %")
+    a02.fill_between(ts, 0, fr*100, alpha=.25, color=C["spk"])
+    a02.fill_between(ts, 0, fr.max()*100*zupt, alpha=.25,
+                     color=C["zu"], label="ZUPT (suppressed)")
+    a02.set_ylabel("% neurons firing"); a02.set_xlabel("t(s)")
+    a02.legend(fontsize=6)
+
+    a03 = mkax(0,3,"Pretraining Loss  (static self-supervision)")
+    a03.plot(range(1,len(ptloss)+1), ptloss, color=C["err"], lw=1.5)
+    a03.fill_between(range(1,len(ptloss)+1), 0, ptloss,
+                     alpha=.2, color=C["err"])
+    a03.set_xlabel("Epoch"); a03.set_ylabel("MSE loss")
+    a03.set_yscale("log")
+
+    # ── Row 1  SNN spike raster + orientation ─────────────────────────────────
+    a10 = mkax(1,0,"SNN Layer-2 Spike Raster  (first 64 neurons)")
+    # Subsample time for raster (every 10 frames)
+    t_sub = ts[::10]; sr_sub = sr[::10, :64]
+    spike_mask = sr_sub > 0.05   # threshold for "fired"
+    t_idx, n_idx = np.where(spike_mask)
+    a10.scatter(t_sub[t_idx], n_idx, s=0.5, color=C["spk"], alpha=0.5)
+    a10.set_xlabel("t(s)"); a10.set_ylabel("Neuron index")
+    a10.set_ylim(-1, 64)
+
+    a11 = mkax(1,1,"Orientation — Roll / Pitch / Yaw  (°)")
+    a11.plot(ts,roll, C["x"],label="Roll")
+    a11.plot(ts,pitch,C["y"],label="Pitch")
+    a11.plot(ts,yaw,  C["z"],label="Yaw")
+    a11.legend(fontsize=6); a11.set_xlabel("t(s)")
+
+    a12 = mkax(1,2,"Loop Closure — Spike Similarity Score")
+    sim_vals = lc_sim.copy(); sim_vals[sim_vals==0] = np.nan
+    a12.plot(ts, sim_vals, ".", color=C["lc"], ms=3, alpha=.8,
+             label="Similarity score")
+    if len(lc_idx):
+        a12.scatter(ts[lc_idx], lc_sim[lc_idx], color=C["lc"],
+                    s=50, zorder=5, marker="x")
+    a12.axhline(0.88, color=C["err"], ls="--", lw=0.8, label="Threshold")
+    a12.set_xlabel("t(s)"); a12.set_ylabel("Cosine similarity")
+    a12.legend(fontsize=6)
+
+    a13 = mkax(1,3,"Cumulative Loop Closures")
+    lc_cum = np.cumsum(lc.astype(int))
+    a13.plot(ts, lc_cum, color=C["lc"], lw=1.6)
+    a13.fill_between(ts, 0, lc_cum, alpha=.2, color=C["lc"])
+    a13.set_xlabel("t(s)"); a13.set_ylabel("# closures")
+
+    # ── Row 2  Velocity, biases, position ─────────────────────────────────────
+    a20 = mkax(2,0,"SNN Decoded Velocity  (m/s)")
+    a20.plot(ts,vel[:,0],C["x"],label="Vx",alpha=.8)
+    a20.plot(ts,vel[:,1],C["y"],label="Vy",alpha=.8)
+    a20.plot(ts,vel[:,2],C["z"],label="Vz",alpha=.8)
+    a20.plot(ts,vmag,    C["mag"],label="|V|",lw=1.8)
+    a20.fill_between(ts, 0, vmag.max()*zupt, alpha=.15,
+                     color=C["zu"], label="ZUPT")
+    a20.legend(fontsize=6); a20.set_xlabel("t(s)")
+
+    a21 = mkax(2,1,"Homeostatic Gyro Bias  (rad/s)")
+    a21.plot(ts,gbias[:,0],C["x"],label="bgx")
+    a21.plot(ts,gbias[:,1],C["y"],label="bgy")
+    a21.plot(ts,gbias[:,2],C["z"],label="bgz")
+    a21.legend(fontsize=6); a21.set_xlabel("t(s)")
+
+    a22 = mkax(2,2,"Homeostatic Accel Bias  (m/s²)")
+    a22.plot(ts,abias[:,0],C["x"],label="bax")
+    a22.plot(ts,abias[:,1],C["y"],label="bay")
+    a22.plot(ts,abias[:,2],C["z"],label="baz")
+    a22.legend(fontsize=6); a22.set_xlabel("t(s)")
+
+    a23 = mkax(2,3,"Dead-Reckoning Position  (m)")
+    a23.plot(ts,pos[:,0],C["x"],label="X")
+    a23.plot(ts,pos[:,1],C["y"],label="Y")
+    a23.plot(ts,pos[:,2],C["z"],label="Z")
+    if len(lc_idx):
+        a23.scatter(ts[lc_idx], pos[lc_idx,0], color=C["lc"],
+                    s=25, zorder=5, marker="x", label="LC correction")
+    a23.legend(fontsize=6); a23.set_xlabel("t(s)")
+
+    # ── Row 3  Trajectories + stats ───────────────────────────────────────────
+    a30 = mkax(3,0,"2D Trajectory  X–Y")
+    sc = a30.scatter(pos[:,0],pos[:,1],c=ts,cmap="plasma",s=2,alpha=.8)
+    plt.colorbar(sc,ax=a30,label="t(s)",pad=0.02)
+    if kfs:
+        kfp = np.array([p for _,p in kfs])
+        a30.scatter(kfp[:,0],kfp[:,1],c=C["kf"],s=15,zorder=5,
+                    marker="^",alpha=.6,label="Keyframes")
+    if len(lc_idx):
+        a30.scatter(pos[lc_idx,0],pos[lc_idx,1],
+                    c=C["lc"],s=40,zorder=6,marker="x",label="Loop closure")
+    a30.plot(*pos[0,:2],"o",color=C["y"],ms=8,label="Start",zorder=7)
+    a30.plot(*pos[-1,:2],"*",color=C["z"],ms=12,label="End",zorder=7)
+    a30.set_aspect("equal","datalim"); a30.legend(fontsize=5)
+    a30.set_xlabel("X(m)"); a30.set_ylabel("Y(m)")
+
+    a31 = mkax(3,1,"2D Trajectory  X–Z")
+    sc2 = a31.scatter(pos[:,0],pos[:,2],c=ts,cmap="viridis",s=2,alpha=.8)
+    plt.colorbar(sc2,ax=a31,label="t(s)",pad=0.02)
+    a31.set_aspect("equal","datalim")
+    a31.set_xlabel("X(m)"); a31.set_ylabel("Z(m)")
+
+    a32 = mkax(3,2,"3D Trajectory",proj="3d")
+    a32.set_facecolor("#0a0d18")
+    n=len(pos); step=max(1,n//300)
+    for i in range(0,n-step,step):
+        c=plt.cm.plasma(i/n)
+        a32.plot(pos[i:i+step+1,0],pos[i:i+step+1,1],pos[i:i+step+1,2],
+                 color=c,lw=1.1,alpha=.85)
+    if kfs and len(kfs)>0:
+        kfp = np.array([p for _,p in kfs])
+        a32.scatter(kfp[:,0],kfp[:,1],kfp[:,2],c=C["kf"],s=18,
+                    marker="^",zorder=5,alpha=.7)
+    if len(lc_idx):
+        a32.scatter(pos[lc_idx,0],pos[lc_idx,1],pos[lc_idx,2],
+                    c=C["lc"],s=30,marker="x",zorder=8)
+    a32.scatter(*pos[0], color=C["y"],s=50,zorder=6)
+    a32.scatter(*pos[-1],color=C["z"],s=80,marker="*",zorder=6)
+    a32.set_title("3D Trajectory + Keyframes",color="#4a6888",fontsize=7.5)
+    a32.set_xlabel("X",fontsize=7); a32.set_ylabel("Y",fontsize=7)
+    a32.set_zlabel("Z",fontsize=7)
+    a32.tick_params(colors="#404870",labelsize=6)
+
+    a33 = mkax(3,3,"SNN-SLAM System Report")
+    a33.axis("off")
+    report = (
+        f"  ╔══ SNN-SLAM Report ═══════════════╗\n"
+        f"  ║ Duration        : {ts[-1]:.2f} s\n"
+        f"  ║ Samples         : {len(ts)}\n"
+        f"  ║ Sample rate     : {1/np.mean(np.diff(ts)):.1f} Hz\n"
+        f"  ╠═══════════════════════════════════╣\n"
+        f"  ║ SNN Parameters  : {res['n_params']:,}\n"
+        f"  ║ SNN Layers      : 3 LIF + recurrent\n"
+        f"  ║ Spike timesteps : 8 per sample\n"
+        f"  ║ Encoding        : Rate + Delta\n"
+        f"  ╠═══════════════════════════════════╣\n"
+        f"  ║ ZUPT frames     : {zupt.sum()} ({100*zupt.mean():.1f}%)\n"
+        f"  ║ Mean fire rate  : {fr.mean()*100:.1f}%\n"
+        f"  ║ Keyframes       : {len(kfs)}\n"
+        f"  ║ Loop closures   : {int(lc.sum())}\n"
+        f"  ╠═══════════════════════════════════╣\n"
+        f"  ║ Pretrain epochs : {len(ptloss)}\n"
+        f"  ║ Final PT loss   : {ptloss[-1]:.6f}\n"
+        f"  ╠═══════════════════════════════════╣\n"
+        f"  ║ Final pos X     : {pos[-1,0]:.3f} m\n"
+        f"  ║ Final pos Y     : {pos[-1,1]:.3f} m\n"
+        f"  ║ Final pos Z     : {pos[-1,2]:.3f} m\n"
+        f"  ║ Peak speed      : {vmag.max():.3f} m/s\n"
+        f"  ╚═══════════════════════════════════╝\n"
+    )
+    a33.text(0.02, 0.97, report, transform=a33.transAxes,
+             fontsize=7.5, verticalalignment="top",
+             fontfamily="monospace", color="#8ab8cc",
+             bbox=dict(facecolor="#0e1428",edgecolor="#1e2840",
+                       boxstyle="round,pad=0.5"))
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"[PLOT]  Saved → {save_path}")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Synthetic IMU Generator
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_synthetic_imu(duration=30.0, hz=200, seed=0):
+    np.random.seed(seed)
+    dt = 1.0/hz; N = int(duration*hz)
+    ts = np.arange(N)*dt
+
+    roll0=np.radians(65.0); pitch0=np.radians(5.0)
+    g_body = np.array([
+        -np.sin(pitch0),
+         np.sin(roll0)*np.cos(pitch0),
+         np.cos(roll0)*np.cos(pitch0)]) * GRAVITY
+
+    gx=np.zeros(N); gy=np.zeros(N); gz=np.zeros(N)
+    ax=np.full(N,g_body[0])
+    ay=np.full(N,g_body[1])
+    az=np.full(N,g_body[2])
+
+    # Walk phases
+    s=lambda t: int(t*hz)
+    ax[s(2.5):s(2.5)+40] += 0.6   # forward push
+    ax[s(7.5):s(7.5)+40] -= 0.6   # brake
+    gz[s(8):s(12)] += 0.25         # turn left
+    ax[s(12.5):s(12.5)+40] += 0.5
+    ax[s(22):s(22)+40] -= 0.5
+
+    noise_g=0.003; noise_a=0.04
+    gx += np.random.randn(N)*noise_g + 0.0012
+    gy += np.random.randn(N)*noise_g - 0.0010
+    gz += np.random.randn(N)*noise_g + 0.0011
+    ax += np.random.randn(N)*noise_a
+    ay += np.random.randn(N)*noise_a
+    az += np.random.randn(N)*noise_a
+
+    return np.column_stack([ts,gx,gy,gz,ax,ay,az])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry Point
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    imu_path = "sample_data/imu.txt"
+    out_png  = "imu_snn_result.png"
+    out_csv  = "imu_snn_trajectory.csv"
+
+    print("="*65)
+    print("  IMU SNN-SLAM  —  Spiking Neural Network Navigation  v1")
+    print("="*65)
+
+    if Path(imu_path).exists():
+        data = np.loadtxt(imu_path, comments="#")
+        print(f"[LOAD]  {data.shape[0]} samples from '{imu_path}'")
+    else:
+        print(f"[WARN]  '{imu_path}' not found — generating synthetic data")
+        data = generate_synthetic_imu(duration=30.0, hz=200)
+        print(f"[SYN]   {data.shape[0]} samples generated")
+
+    res = run_snn_slam(
+        data,
+        n_static        = 200,
+        zupt_thresh     = 0.04,
+        zupt_win        = 15,
+        n_steps         = 8,
+        pretrain_epochs = 30,
+        velocity_scale  = 0.08,
+        attitude_scale  = 0.015,
+        lc_sim_thresh   = 0.88,
+        lc_min_gap      = 5.0,
+        lc_radius       = 3.0,
+    )
+
+    # CSV export
+    t_rel = res["ts"] - res["ts"][0]
+    out = np.column_stack([
+        t_rel, res["pos"], res["vel"],
+        np.degrees(res["euler"]),
+        res["gbias"], res["abias"],
+        res["fire_rate"],
+        res["zupt"].astype(int),
+        res["lc"].astype(int),
+        res["lc_sim"],
+        np.linalg.norm(res["vel"],axis=1)
+    ])
+    hdr = ("time_s,x,y,z,vx,vy,vz,"
+           "roll_deg,pitch_deg,yaw_deg,"
+           "gbx,gby,gbz,abx,aby,abz,"
+           "fire_rate,zupt,loop_closure,lc_similarity,speed_ms")
+    np.savetxt(out_csv, out, delimiter=",", header=hdr, comments="")
+    print(f"[CSV]   Saved → {out_csv}")
+
+    plot_snn(res, save_path=out_png)
+    print(f"\n[DONE]  All outputs written.")
+
+
+if __name__ == "__main__":
+    main()
