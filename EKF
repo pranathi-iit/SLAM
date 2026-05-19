@@ -1,0 +1,618 @@
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.spatial.transform import Rotation as ScipyRot
+import sys
+from pathlib import Path
+
+GRAVITY = 9.81
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Quaternion utilities  [w, x, y, z]
+# ═══════════════════════════════════════════════════════════════════════════
+
+def qmult(q, r):
+    w0,x0,y0,z0 = q; w1,x1,y1,z1 = r
+    return np.array([
+        w0*w1-x0*x1-y0*y1-z0*z1,
+        w0*x1+x0*w1+y0*z1-z0*y1,
+        w0*y1-x0*z1+y0*w1+z0*x1,
+        w0*z1+x0*y1-y0*x1+z0*w1])
+
+def qconj(q): return np.array([q[0],-q[1],-q[2],-q[3]])
+def qnorm(q): n=np.linalg.norm(q); return q/n if n>1e-12 else q
+
+def qrot(q, v):
+    return qmult(qmult(q, [0,v[0],v[1],v[2]]), qconj(q))[1:]
+
+def euler_to_quat(roll, pitch, yaw):
+    cr,sr = np.cos(roll/2), np.sin(roll/2)
+    cp,sp = np.cos(pitch/2), np.sin(pitch/2)
+    cy,sy = np.cos(yaw/2), np.sin(yaw/2)
+    return qnorm(np.array([
+        cr*cp*cy+sr*sp*sy,
+        sr*cp*cy-cr*sp*sy,
+        cr*sp*cy+sr*cp*sy,
+        cr*cp*sy-sr*sp*cy]))
+
+def quat_to_euler(q):
+    w,x,y,z = q
+    roll  = np.arctan2(2*(w*x+y*z), 1-2*(x*x+y*y))
+    pitch = np.arcsin(np.clip(2*(w*y-z*x),-1,1))
+    yaw   = np.arctan2(2*(w*z+x*y), 1-2*(y*y+z*z))
+    return np.array([roll, pitch, yaw])
+
+def skew(v):
+    """3×3 skew-symmetric matrix of vector v."""
+    return np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
+
+def euler_to_rot(roll, pitch, yaw):
+    cr,sr = np.cos(roll),np.sin(roll)
+    cp,sp = np.cos(pitch),np.sin(pitch)
+    cy,sy = np.cos(yaw),np.sin(yaw)
+    Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
+    Ry = np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
+    Rz = np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
+    return Rz@Ry@Rx
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 15-State Extended Kalman Filter
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EKF15State:
+    """
+    State:  x = [p(3), v(3), euler(3), bg(3), ba(3)]
+            P = 15×15 covariance matrix
+
+    Noise tuning:
+        Q  — process noise: how much we trust the IMU model
+        R_zupt — measurement noise for ZUPT (how confident zero-vel is)
+        R_closure — loop-closure position uncertainty
+    """
+
+    def __init__(self, pos0, vel0, euler0, gyro_bias0, accel_bias0):
+        self.x = np.concatenate([pos0, vel0, euler0, gyro_bias0, accel_bias0])
+
+        # Initial covariance — low confidence on position/yaw, high on biases
+        self.P = np.diag([
+            0.01, 0.01, 0.01,       # position (m²)
+            0.01, 0.01, 0.01,       # velocity (m/s)²
+            1e-4, 1e-4, 1e-3,       # roll, pitch, yaw (rad²)
+            1e-8, 1e-8, 1e-8,       # gyro bias
+            1e-6, 1e-6, 1e-6,       # accel bias
+        ])
+
+        # Process noise spectral density
+        self.Q = np.diag([
+            1e-6, 1e-6, 1e-6,       # position process noise
+            1e-4, 1e-4, 1e-4,       # velocity
+            1e-5, 1e-5, 1e-4,       # attitude (yaw noisier)
+            1e-9, 1e-9, 1e-9,       # gyro bias walk
+            1e-7, 1e-7, 1e-7,       # accel bias walk
+        ])
+
+    @property
+    def pos(self):   return self.x[0:3]
+    @property
+    def vel(self):   return self.x[3:6]
+    @property
+    def euler(self): return self.x[6:9]
+    @property
+    def gbias(self): return self.x[9:12]
+    @property
+    def abias(self): return self.x[12:15]
+
+    # ── PREDICT step ────────────────────────────────────────────────────────
+    def predict(self, gyro_raw, accel_raw, dt):
+        """
+        IMU motion model. Propagates state and covariance forward by dt.
+        F = Jacobian of f(x, u) w.r.t. x  (linearisation point = current x)
+        """
+        # Corrected IMU
+        omega = gyro_raw  - self.gbias
+        a_b    = accel_raw - self.abias
+
+        roll, pitch, yaw = self.euler
+        R = euler_to_rot(roll, pitch, yaw)
+
+        # Linear acceleration in world frame
+        a_w = R @ a_b - np.array([0., 0., GRAVITY])
+
+        # State propagation  (simple Euler, fine at 200 Hz)
+        p_new   = self.pos   + self.vel * dt + 0.5 * a_w * dt**2
+        v_new   = self.vel   + a_w * dt
+        # Attitude integration via small-angle rotation
+        dtheta  = omega * dt
+        e_new   = self.euler + dtheta           # approx; full quaternion in production
+
+        # Clamp pitch to avoid gimbal lock singularity
+        e_new[1] = np.clip(e_new[1], -np.pi/2+0.01, np.pi/2-0.01)
+
+        # Wrap angles to [-π, π]
+        e_new = (e_new + np.pi) % (2*np.pi) - np.pi
+
+        # Biases are random-walk — no change in mean
+        self.x = np.concatenate([p_new, v_new, e_new, self.gbias, self.abias])
+
+        # ── Linearised state transition matrix F (15×15) ──────────────────
+        F = np.eye(15)
+
+        # dp/dv
+        F[0:3, 3:6] = np.eye(3) * dt
+
+        # dv/deuler  (how attitude error rotates a_b into world accel error)
+        # Jacobian of R(euler)·a_b w.r.t. euler  (simplified cross-product form)
+        F[3:6, 6:9] = -skew(R @ a_b) @ self._euler_jacobian(roll,pitch,yaw) * dt
+
+        # dv/dabias
+        F[3:6, 12:15] = -R * dt
+
+        # deuler/dgbias
+        F[6:9, 9:12] = -np.eye(3) * dt
+
+        # ── Covariance propagation ─────────────────────────────────────────
+        self.P = F @ self.P @ F.T + self.Q * dt
+
+    def _euler_jacobian(self, roll, pitch, yaw):
+        """Partial of R·v w.r.t. euler (approximate for small angles)."""
+        return np.eye(3)   # first-order approx adequate here
+
+    # ── UPDATE step (ZUPT measurement) ──────────────────────────────────────
+    def update_zupt(self, R_zupt=None):
+        """
+        Measurement: velocity = 0 (3D)
+        H = [0(3×3) | I(3×3) | 0(3×9)]   (selects velocity states)
+        Innovation: z - Hx = 0 - v
+        """
+        if R_zupt is None:
+            R_zupt = np.diag([0.001, 0.001, 0.001])   # tight: we're confident
+
+        H = np.zeros((3, 15))
+        H[0:3, 3:6] = np.eye(3)
+
+        S = H @ self.P @ H.T + R_zupt
+        K = self.P @ H.T @ np.linalg.inv(S)     # Kalman gain
+
+        innovation = np.zeros(3) - self.vel      # z=0, predicted=v
+        self.x += K @ innovation
+        self.P = (np.eye(15) - K @ H) @ self.P
+
+        # Symmetrise to prevent numerical drift
+        self.P = 0.5 * (self.P + self.P.T)
+
+        return float(np.linalg.norm(innovation))
+
+    # ── UPDATE step (loop closure) ───────────────────────────────────────────
+    def update_loop_closure(self, pos_meas, R_closure=None):
+        """
+        Measurement: position from loop-closure detector.
+        H = [I(3×3) | 0(3×12)]
+        """
+        if R_closure is None:
+            R_closure = np.diag([0.5, 0.5, 0.5])   # 0.5m std dev
+
+        H = np.zeros((3, 15))
+        H[0:3, 0:3] = np.eye(3)
+
+        S = H @ self.P @ H.T + R_closure
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        innovation = pos_meas - self.pos
+        self.x += K @ innovation
+        self.P = (np.eye(15) - K @ H) @ self.P
+        self.P = 0.5 * (self.P + self.P.T)
+
+        return float(np.linalg.norm(innovation))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ZUPT Detector  (gyro-magnitude based)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ZUPTDetector:
+    def __init__(self, window=15, thresh=0.04):
+        self.window = window; self.thresh = thresh; self._buf = []
+
+    def update(self, gx, gy, gz):
+        self._buf.append(gx**2+gy**2+gz**2)
+        if len(self._buf) > self.window: self._buf.pop(0)
+        return np.sqrt(np.mean(self._buf)) < self.thresh
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Simulated Loop-Closure Detector
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LoopClosureDetector:
+    """
+    In a real system this is a place-recognition module (scan matching,
+    visual bag-of-words, etc.).  Here we simulate it: if the EKF position
+    estimate comes within `radius` metres of a previously visited keyframe,
+    we report a loop closure at the keyframe position.
+
+    Keyframes are added every `kf_interval` seconds during low-motion phases.
+    """
+    def __init__(self, kf_interval=3.0, closure_radius=4.0):
+        self.kf_interval = kf_interval
+        self.closure_radius = closure_radius
+        self.keyframes = []        # list of (time, position)
+        self._last_kf_time = -np.inf
+
+    def try_add_keyframe(self, t, pos, gyro_mag):
+        if gyro_mag < 0.1 and (t - self._last_kf_time) > self.kf_interval:
+            self.keyframes.append((t, pos.copy()))
+            self._last_kf_time = t
+            return True
+        return False
+
+    def detect(self, t, pos):
+        """Return (True, kf_pos) if loop closure detected, else (False, None)."""
+        for kf_t, kf_pos in self.keyframes:
+            if (t - kf_t) < self.kf_interval * 2:
+                continue   # too recent to be a real revisit
+            dist = np.linalg.norm(pos - kf_pos)
+            if dist < self.closure_radius:
+                return True, kf_pos
+        return False, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Static Initialisation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def static_init(data, n_static=200):
+    static = data[:n_static]
+    gyro_bias  = static[:, 1:4].mean(axis=0)
+    accel_mean = static[:, 4:7].mean(axis=0)
+    g_mag      = np.linalg.norm(accel_mean)
+
+    roll  = np.arctan2(accel_mean[1], accel_mean[2])
+    pitch = np.arctan2(-accel_mean[0],
+                       np.sqrt(accel_mean[1]**2 + accel_mean[2]**2))
+    yaw   = 0.0
+
+    accel_bias = accel_mean - g_mag * np.array([
+        -np.sin(pitch),
+         np.cos(pitch)*np.sin(roll),
+         np.cos(pitch)*np.cos(roll)])
+
+    return gyro_bias, accel_bias, np.array([roll, pitch, yaw])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main EKF SLAM Pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_ekf_slam(data,
+                 zupt_thresh=0.04, zupt_win=15,
+                 n_static=200,
+                 enable_loop_closure=True):
+
+    N  = len(data)
+    ts = data[:, 0]
+
+    # ── Initialise ──────────────────────────────────────────────────────────
+    gyro_bias0, accel_bias0, euler0 = static_init(data, n_static)
+    print(f"[INIT]  Gyro bias  : {gyro_bias0}")
+    print(f"[INIT]  Accel bias : {accel_bias0}")
+    print(f"[INIT]  Roll={np.degrees(euler0[0]):.2f}°  "
+          f"Pitch={np.degrees(euler0[1]):.2f}°")
+
+    ekf  = EKF15State(
+        pos0=np.zeros(3), vel0=np.zeros(3), euler0=euler0,
+        gyro_bias0=gyro_bias0, accel_bias0=accel_bias0)
+
+    zupt   = ZUPTDetector(window=zupt_win, thresh=zupt_thresh)
+    lcd    = LoopClosureDetector(kf_interval=3.0, closure_radius=4.0)
+
+    # ── Output buffers ───────────────────────────────────────────────────────
+    pos_h   = np.zeros((N,3)); vel_h   = np.zeros((N,3))
+    euler_h = np.zeros((N,3))
+    gbias_h = np.zeros((N,3)); abias_h = np.zeros((N,3))
+    std_pos = np.zeros((N,3)); std_vel = np.zeros((N,3))
+    zupt_h  = np.zeros(N, dtype=bool)
+    zupt_inn= np.zeros(N)         # ZUPT innovation (velocity magnitude)
+    closure_h = np.zeros(N, dtype=bool)
+    nkf = 0; n_closures = 0
+
+    for i in range(N):
+        dt = float(ts[i]-ts[i-1]) if i>0 else 0.005
+        dt = np.clip(dt, 1e-4, 0.05)
+
+        gyro_raw  = data[i, 1:4]
+        accel_raw = data[i, 4:7]
+
+        # ── PREDICT ────────────────────────────────────────────────────────
+        ekf.predict(gyro_raw, accel_raw, dt)
+
+        # ── ZUPT UPDATE ────────────────────────────────────────────────────
+        gyro_corr = gyro_raw - ekf.gbias
+        is_static = zupt.update(*gyro_corr)
+        zupt_h[i] = is_static
+        if is_static:
+            inn = ekf.update_zupt()
+            zupt_inn[i] = inn
+
+        # ── LOOP CLOSURE ────────────────────────────────────────────────────
+        if enable_loop_closure:
+            gm = np.linalg.norm(gyro_corr)
+            lcd.try_add_keyframe(ts[i]-ts[0], ekf.pos, gm)
+            closed, kf_pos = lcd.detect(ts[i]-ts[0], ekf.pos)
+            if closed:
+                ekf.update_loop_closure(kf_pos)
+                closure_h[i] = True
+                n_closures += 1
+
+        # ── Record ─────────────────────────────────────────────────────────
+        pos_h[i]   = ekf.pos;  vel_h[i]   = ekf.vel
+        euler_h[i] = ekf.euler
+        gbias_h[i] = ekf.gbias; abias_h[i] = ekf.abias
+        std_pos[i] = np.sqrt(np.diag(ekf.P)[0:3])
+        std_vel[i] = np.sqrt(np.diag(ekf.P)[3:6])
+
+    print(f"[DONE]  {N} samples | {ts[-1]-ts[0]:.2f}s")
+    print(f"[ZUPT]  {zupt_h.sum()} static frames  ({100*zupt_h.mean():.1f}%)")
+    print(f"[KF]    Keyframes stored  : {len(lcd.keyframes)}")
+    print(f"[LC]    Loop closures     : {n_closures}")
+    print(f"[POS]   Final position (m): {pos_h[-1]}")
+    print(f"[STD]   Pos std dev  (m)  : {std_pos[-1]}")
+
+    return dict(ts=ts, pos=pos_h, vel=vel_h, euler=euler_h,
+                gbias=gbias_h, abias=abias_h,
+                std_pos=std_pos, std_vel=std_vel,
+                zupt=zupt_h, zupt_inn=zupt_inn,
+                closure=closure_h, raw=data,
+                keyframes=lcd.keyframes)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Visualisation — 16-panel dashboard
+# ═══════════════════════════════════════════════════════════════════════════
+
+def plot_ekf(res, save_path=None):
+    ts    = res["ts"] - res["ts"][0]
+    pos   = res["pos"]; vel = res["vel"]
+    euler = res["euler"]
+    roll  = np.degrees(euler[:,0])
+    pitch = np.degrees(euler[:,1])
+    yaw   = np.degrees(euler[:,2])
+    gbias = res["gbias"]; abias = res["abias"]
+    sp    = res["std_pos"]; sv = res["std_vel"]
+    zupt  = res["zupt"]; clos = res["closure"]
+    raw   = res["raw"]; kfs = res["keyframes"]
+    vmag  = np.linalg.norm(vel, axis=1)
+    amag  = np.linalg.norm(raw[:,4:7], axis=1)
+
+    plt.rcParams.update({
+        "figure.facecolor":"#080a0f","axes.facecolor":"#0e1118",
+        "axes.edgecolor":"#202535","axes.labelcolor":"#b0b8cc",
+        "xtick.color":"#505870","ytick.color":"#505870",
+        "text.color":"#b0b8cc","grid.color":"#161c28",
+        "grid.linewidth":0.5,"lines.linewidth":1.3,
+        "font.family":"monospace","font.size":7.5,
+    })
+
+    C = dict(x="#00d8ff",y="#39ff14",z="#ff8c42",
+             mag="#ffd700",zu="#80ff80",lc="#ff50a0",
+             sp="#5b9dff",err="#ff4060",cov="#9966ff")
+
+    fig = plt.figure(figsize=(26,18))
+    fig.suptitle(
+        "EKF Tightly-Coupled IMU SLAM  —  15-State Navigation Filter",
+        fontsize=16, fontweight="bold", color="#dde2f4", y=0.985)
+    gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.52, wspace=0.38)
+
+    def mkax(r, c, title, proj=None):
+        a = fig.add_subplot(gs[r,c], projection=proj) if proj else fig.add_subplot(gs[r,c])
+        a.set_title(title, color="#5a7090", fontsize=7.5, pad=3)
+        if not proj: a.grid(True, alpha=0.35)
+        return a
+
+    # ── Row 0: raw signals ───────────────────────────────────────────────────
+    a00 = mkax(0,0,"Raw gyroscope  (rad/s)")
+    a00.plot(ts,raw[:,1],C["x"],label="ωx",alpha=.8)
+    a00.plot(ts,raw[:,2],C["y"],label="ωy",alpha=.8)
+    a00.plot(ts,raw[:,3],C["z"],label="ωz",alpha=.8)
+    a00.legend(fontsize=6); a00.set_xlabel("t(s)")
+
+    a01 = mkax(0,1,"Raw accelerometer  (m/s²)")
+    a01.plot(ts,raw[:,4],C["x"],label="ax",alpha=.8)
+    a01.plot(ts,raw[:,5],C["y"],label="ay",alpha=.8)
+    a01.plot(ts,raw[:,6],C["z"],label="az",alpha=.8)
+    a01.legend(fontsize=6); a01.set_xlabel("t(s)")
+
+    a02 = mkax(0,2,"|Accel| magnitude + |Gyro|  (m/s²)")
+    a02.plot(ts,amag,C["mag"],lw=1.2,label="|accel|")
+    a02.axhline(GRAVITY,color=C["err"],ls="--",lw=0.8,label="g")
+    gm = np.linalg.norm(raw[:,1:4],axis=1)
+    ax2b = a02.twinx()
+    ax2b.plot(ts,gm,C["sp"],lw=0.9,alpha=.6,label="|ω|")
+    ax2b.set_ylabel("|ω| (rad/s)", color=C["sp"], fontsize=7)
+    ax2b.tick_params(colors=C["sp"])
+    a02.legend(fontsize=6,loc="upper left"); a02.set_xlabel("t(s)")
+
+    a03 = mkax(0,3,"EKF: pos std-deviation  (m)")
+    a03.plot(ts,sp[:,0],C["x"],label="σ_X")
+    a03.plot(ts,sp[:,1],C["y"],label="σ_Y")
+    a03.plot(ts,sp[:,2],C["z"],label="σ_Z")
+    for i in np.where(clos)[0]:
+        a03.axvline(ts[i],color=C["lc"],alpha=0.6,lw=0.8)
+    a03.legend(fontsize=6); a03.set_xlabel("t(s)")
+    a03.set_ylabel("σ (m)")
+
+    # ── Row 1: orientation ────────────────────────────────────────────────────
+    a10 = mkax(1,0,"Orientation — Roll (°)")
+    a10.plot(ts,roll,C["x"]); a10.set_xlabel("t(s)")
+
+    a11 = mkax(1,1,"Orientation — Pitch (°)")
+    a11.plot(ts,pitch,C["y"]); a10.set_xlabel("t(s)")
+
+    a12 = mkax(1,2,"Orientation — Yaw (°)")
+    a12.plot(ts,yaw,C["z"]); a12.set_xlabel("t(s)")
+
+    a13 = mkax(1,3,"EKF: velocity std-dev  (m/s)")
+    a13.plot(ts,sv[:,0],C["x"],label="σ_vx")
+    a13.plot(ts,sv[:,1],C["y"],label="σ_vy")
+    a13.plot(ts,sv[:,2],C["z"],label="σ_vz")
+    a13.legend(fontsize=6); a13.set_xlabel("t(s)")
+
+    # ── Row 2: velocity, bias estimation, ZUPT ────────────────────────────────
+    a20 = mkax(2,0,"EKF velocity  (m/s)")
+    a20.plot(ts,vel[:,0],C["x"],label="Vx",alpha=.8)
+    a20.plot(ts,vel[:,1],C["y"],label="Vy",alpha=.8)
+    a20.plot(ts,vel[:,2],C["z"],label="Vz",alpha=.8)
+    a20.plot(ts,vmag,C["mag"],label="|V|",lw=1.8)
+    a20.fill_between(ts,0,vmag.max()*zupt,alpha=.15,color=C["zu"],label="ZUPT")
+    a20.legend(fontsize=6); a20.set_xlabel("t(s)")
+
+    a21 = mkax(2,1,"EKF gyro bias estimate  (rad/s)")
+    a21.plot(ts,gbias[:,0],C["x"],label="bgx")
+    a21.plot(ts,gbias[:,1],C["y"],label="bgy")
+    a21.plot(ts,gbias[:,2],C["z"],label="bgz")
+    a21.legend(fontsize=6); a21.set_xlabel("t(s)")
+    a21.set_ylabel("bias (rad/s)")
+
+    a22 = mkax(2,2,"EKF accel bias estimate  (m/s²)")
+    a22.plot(ts,abias[:,0],C["x"],label="bax")
+    a22.plot(ts,abias[:,1],C["y"],label="bay")
+    a22.plot(ts,abias[:,2],C["z"],label="baz")
+    a22.legend(fontsize=6); a22.set_xlabel("t(s)")
+    a22.set_ylabel("bias (m/s²)")
+
+    a23 = mkax(2,3,"ZUPT innovation  |Δv|  (m/s)")
+    inn = res["zupt_inn"].copy()
+    inn[inn==0] = np.nan
+    a23.plot(ts,inn,".",color=C["zu"],ms=2,alpha=.6)
+    a23.set_xlabel("t(s)"); a23.set_ylabel("m/s")
+
+    # ── Row 3: trajectories ───────────────────────────────────────────────────
+    a30 = mkax(3,0,"2D Trajectory  X–Y")
+    sc = a30.scatter(pos[:,0],pos[:,1],c=ts,cmap="plasma",s=2,alpha=.8)
+    if kfs:
+        kfpos = np.array([p for _,p in kfs])
+        a30.scatter(kfpos[:,0],kfpos[:,1],c="white",s=18,
+                    zorder=5,label="Keyframes",marker="^",alpha=.7)
+    for i in np.where(clos)[0]:
+        a30.scatter(pos[i,0],pos[i,1],c=C["lc"],s=30,zorder=6,marker="x")
+    a30.plot(*pos[0,:2],"o",color=C["y"],ms=8,label="Start",zorder=7)
+    a30.plot(*pos[-1,:2],"*",color=C["z"],ms=12,label="End",zorder=7)
+    plt.colorbar(sc,ax=a30,label="t(s)",pad=0.02)
+    a30.set_aspect("equal","datalim"); a30.legend(fontsize=6)
+    a30.set_xlabel("X(m)"); a30.set_ylabel("Y(m)")
+
+    a31 = mkax(3,1,"2D Trajectory  X–Z")
+    sc2 = a31.scatter(pos[:,0],pos[:,2],c=ts,cmap="viridis",s=2,alpha=.8)
+    plt.colorbar(sc2,ax=a31,label="t(s)",pad=0.02)
+    a31.set_aspect("equal","datalim")
+    a31.set_xlabel("X(m)"); a31.set_ylabel("Z(m)")
+
+    a32 = mkax(3,2,"3D Trajectory",proj="3d")
+    a32.set_facecolor("#0e1118")
+    n=len(pos); step=max(1,n//300)
+    for i in range(0,n-step,step):
+        c=plt.cm.plasma(i/n)
+        a32.plot(pos[i:i+step+1,0],pos[i:i+step+1,1],pos[i:i+step+1,2],
+                 color=c,lw=1.1,alpha=.85)
+    if kfs:
+        a32.scatter(kfpos[:,0],kfpos[:,1],kfpos[:,2],c="white",s=20,
+                    marker="^",zorder=5,label="KF",alpha=.8)
+    a32.scatter(*pos[0],color=C["y"],s=50,zorder=6)
+    a32.scatter(*pos[-1],color=C["z"],s=80,marker="*",zorder=6)
+    a32.set_title("3D Trajectory",color="#5a7090",fontsize=7.5,pad=4)
+    a32.set_xlabel("X",fontsize=7); a32.set_ylabel("Y",fontsize=7)
+    a32.set_zlabel("Z",fontsize=7)
+    a32.tick_params(colors="#505870",labelsize=6)
+
+    # Stats panel
+    a33 = mkax(3,3,"Pipeline report")
+    a33.axis("off")
+    report = (
+        f"  ╔══ EKF SLAM Report ══════════════╗\n"
+        f"  ║ Duration        : {ts[-1]:.2f} s\n"
+        f"  ║ Samples         : {len(ts)}\n"
+        f"  ║ Sample rate     : {1/np.mean(np.diff(ts)):.1f} Hz\n"
+        f"  ╠═══════════════════════════════╣\n"
+        f"  ║ State dim       : 15\n"
+        f"  ║ ZUPT frames     : {zupt.sum()} ({100*zupt.mean():.1f}%)\n"
+        f"  ║ Keyframes       : {len(kfs)}\n"
+        f"  ║ Loop closures   : {int(clos.sum())}\n"
+        f"  ╠═══════════════════════════════╣\n"
+        f"  ║ Peak |ω|        : {gm.max():.2f} rad/s\n"
+        f"  ║ Peak |a|        : {amag.max():.2f} m/s²\n"
+        f"  ║ Peak speed      : {vmag.max():.3f} m/s\n"
+        f"  ╠═══════════════════════════════╣\n"
+        f"  ║ Final pos X     : {pos[-1,0]:.3f} m\n"
+        f"  ║ Final pos Y     : {pos[-1,1]:.3f} m\n"
+        f"  ║ Final pos Z     : {pos[-1,2]:.3f} m\n"
+        f"  ║ Final σ pos     : {sp[-1,0]:.3f} m\n"
+        f"  ╚═══════════════════════════════╝\n"
+    )
+    a33.text(0.02, 0.97, report, transform=a33.transAxes,
+             fontsize=7.5, verticalalignment="top",
+             fontfamily="monospace", color="#8aaBb8",
+             bbox=dict(facecolor="#141828",edgecolor="#2a3050",
+                       boxstyle="round,pad=0.5"))
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"[PLOT]  Saved → {save_path}")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    imu_path = "imu.txt"
+    # Create a dummy imu.txt file if it doesn't exist
+    if not Path(imu_path).exists():
+        print(f"[INFO] Creating a dummy '{imu_path}' file.")
+        dummy_data = np.zeros((1000, 7))
+        dummy_data[:, 0] = np.arange(1000) * 0.01  # time (100 Hz)
+        dummy_data[:, 4] = 9.81  # accel_z (gravity)
+        np.savetxt(imu_path, dummy_data, delimiter=' ')
+
+    out_png  = "imu_ekf_result.png" # Fixed: always use default for Colab
+    out_csv  = "imu_ekf_trajectory.csv" # Fixed: always use default for Colab
+
+    print("="*60)
+    print("  EKF Tightly-Coupled IMU SLAM  —  15-State Filter")
+    print("="*60)
+
+    data = np.loadtxt(imu_path, comments="#")
+    print(f"[LOAD]  {data.shape[0]} samples from '{imu_path}'")
+
+    res = run_ekf_slam(data,
+                       zupt_thresh=0.04,
+                       zupt_win=15,
+                       n_static=200,
+                       enable_loop_closure=True)
+
+    # CSV
+    t_rel = res["ts"] - res["ts"][0]
+    out = np.column_stack([
+        t_rel, res["pos"], res["vel"],
+        np.degrees(res["euler"]),
+        res["gbias"], res["abias"],
+        res["std_pos"], res["std_vel"],
+        res["zupt"].astype(int),
+        res["closure"].astype(int),
+    ])
+    hdr = ("time_s,x,y,z,vx,vy,vz,"
+           "roll_deg,pitch_deg,yaw_deg,"
+           "gbx,gby,gbz,abx,aby,abz,"
+           "sx,sy,sz,svx,svy,svz,"
+           "zupt,loop_closure")
+    np.savetxt(out_csv, out, delimiter=",", header=hdr, comments="")
+    print(f"[CSV]   Saved → {out_csv}")
+
+    plot_ekf(res, save_path=out_png)
+
+if __name__ == "__main__":
+    main()
