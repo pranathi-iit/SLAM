@@ -614,5 +614,8 @@ def main():
 
     plot_ekf(res, save_path=out_png)
 
+from IPython.display import Image, display
+display(Image('imu_ekf_result.png'))
+
 if __name__ == "__main__":
     main()
