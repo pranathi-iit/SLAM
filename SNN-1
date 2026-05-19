@@ -941,7 +941,8 @@ def main():
 
     plot_snn(res, save_path=out_png)
     print(f"\n[DONE]  All outputs written.")
-
+from IPython.display import Image, display
+display(Image('imu_snn_result.png'))
 
 if __name__ == "__main__":
     main()
