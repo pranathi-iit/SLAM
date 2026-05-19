@@ -1,0 +1,859 @@
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import sys
+from pathlib import Path
+
+GRAVITY   = 9.81
+DT_SIM    = 0.005       # simulation timestep (s) — matches ~200 Hz IMU
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  LIF Neuron  (Leaky Integrate-and-Fire)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LIFNeuron:
+    """
+    Membrane potential equation:
+        τ · dV/dt = −V + R·I(t)
+
+    Discretised (Euler):
+        V[t+1] = V[t] · (1 − dt/τ) + I(t) · dt/τ
+
+    Fires (spike=1) when V ≥ V_thresh, then resets to V_reset.
+    Stays silent during refractory period t_ref after a spike.
+    """
+    def __init__(self, n_neurons: int,
+                 tau: float = 0.02,        # membrane time constant (s)
+                 v_thresh: float = 1.0,    # firing threshold
+                 v_reset: float = 0.0,     # post-spike reset potential
+                 v_rest: float = 0.0,      # resting potential
+                 t_ref: float = 0.002,     # refractory period (s)
+                 R: float = 1.0):          # membrane resistance
+        self.n  = n_neurons
+        self.tau = tau; self.thresh = v_thresh
+        self.reset = v_reset; self.rest = v_rest
+        self.t_ref = t_ref; self.R = R
+
+        self.V   = np.full(n_neurons, v_rest, dtype=float)
+        self.ref = np.zeros(n_neurons, dtype=float)   # refractory countdown
+
+    def step(self, I: np.ndarray, dt: float) -> np.ndarray:
+        """
+        I : (n_neurons,) input current vector
+        Returns: spike vector (0/1)
+        """
+        active = self.ref <= 0                        # not refractory
+
+        # Euler integration only for active neurons
+        leak = (self.rest - self.V) / self.tau
+        self.V += dt * (leak + self.R * I / self.tau) * active
+
+        # Fire
+        spikes = (self.V >= self.thresh) & active
+        self.V[spikes]   = self.reset
+        self.ref[spikes] = self.t_ref
+
+        # Decay refractory
+        self.ref = np.maximum(0.0, self.ref - dt)
+        return spikes.astype(float)
+
+    def reset_state(self):
+        self.V[:]  = self.rest
+        self.ref[:] = 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  Rate Encoder  (real value → spike train)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RateEncoder:
+    """
+    Population rate coding:
+    Each scalar input channel is encoded by N_POP neurons.
+    Neuron k fires at rate proportional to how close the input is to
+    its preferred value (Gaussian tuning curve).
+
+    This gives better precision than single-neuron rate coding and is
+    biologically plausible (place cells, grid cells in hippocampus).
+
+    For signed inputs we use two populations: positive and negative.
+    """
+    def __init__(self, n_channels: int, n_pop: int = 6,
+                 val_min: float = -20.0, val_max: float = 20.0,
+                 max_rate: float = 200.0):
+        self.nc      = n_channels
+        self.npop    = n_pop
+        self.max_r   = max_rate
+        self.centers = np.linspace(val_min, val_max, n_pop)
+        self.sigma   = (val_max - val_min) / (n_pop - 1) * 0.8
+
+        # One LIF layer per channel × population
+        self.neurons = LIFNeuron(n_channels * n_pop,
+                                 tau=0.005, v_thresh=0.9,
+                                 t_ref=0.001, R=1.2)
+        self._phase = np.random.uniform(0, 1, n_channels * n_pop)
+
+    def encode(self, values: np.ndarray, dt: float) -> np.ndarray:
+        """
+        values : (n_channels,)
+        Returns spikes : (n_channels × n_pop,)
+        """
+        # Gaussian tuning: firing rate for each population neuron
+        rates = np.zeros(self.nc * self.npop)
+        for c, v in enumerate(values):
+            for p, ctr in enumerate(self.centers):
+                idx = c * self.npop + p
+                rates[idx] = self.max_r * np.exp(
+                    -0.5 * ((v - ctr) / self.sigma)**2)
+
+        # Convert rate → current (Poisson-like deterministic)
+        I = rates * dt + 0.05 * np.random.randn(len(rates))
+        return self.neurons.step(I, dt)
+
+    def decode(self, spikes: np.ndarray) -> np.ndarray:
+        """
+        Population vector decoding:
+        ̂x = Σ(spike_k × center_k) / Σ(spike_k)   per channel
+        """
+        decoded = np.zeros(self.nc)
+        for c in range(self.nc):
+            seg   = spikes[c*self.npop:(c+1)*self.npop]
+            total = seg.sum()
+            if total > 0:
+                decoded[c] = np.dot(seg, self.centers) / total
+            else:
+                decoded[c] = 0.0
+        return decoded
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  SNN Orientation Network (gyro spikes → roll/pitch/yaw)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SNNOrientationNetwork:
+    """
+    Two-layer SNN:
+      Layer 1  (encoder)  : 3 gyro channels × 6 pop neurons = 18 neurons
+      Layer 2  (integrator): 3 output neurons (one per axis)
+
+    The integrator neurons accumulate weighted spike input from the encoder.
+    Output = running weighted integral of gyro spikes → orientation estimate.
+
+    STDP adjusts encoder→integrator weights online to reduce drift.
+    """
+    def __init__(self):
+        # Encoder: 3 gyro channels
+        self.gyro_enc = RateEncoder(n_channels=3, n_pop=8,
+                                    val_min=-20.0, val_max=20.0)
+        # Accel encoder for tilt correction
+        self.acc_enc  = RateEncoder(n_channels=3, n_pop=6,
+                                    val_min=-15.0, val_max=15.0)
+
+        # Integrator neurons (one per orientation axis)
+        self.integrator = LIFNeuron(3, tau=0.05, v_thresh=0.8,
+                                    v_reset=0.0, t_ref=0.002)
+
+        # Synaptic weights: gyro_enc (24) → integrator (3)
+        n_pre = 3 * 8
+        self.W_gyro = np.random.uniform(0.01, 0.05, (3, n_pre))
+
+        # Accel → integrator correction weights (18 → 3)
+        n_acc = 3 * 6
+        self.W_acc  = np.random.uniform(0.005, 0.02, (3, n_acc))
+
+        # STDP parameters
+        self.A_plus  = 0.005    # potentiation amplitude
+        self.A_minus = 0.003    # depression amplitude
+        self.tau_stdp = 0.02    # STDP time window (s)
+
+        # State
+        self.orientation = np.zeros(3)        # [roll, pitch, yaw] rad
+        self._last_pre_t  = np.full(3*8, -1.0)
+        self._last_post_t = np.full(3,   -1.0)
+        self._t = 0.0
+
+    def step(self, gyro_raw: np.ndarray, accel_raw: np.ndarray,
+             gyro_bias: np.ndarray, dt: float) -> np.ndarray:
+        self._t += dt
+        gyro_corr = gyro_raw - gyro_bias
+
+        # ── Encode ────────────────────────────────────────────────────────
+        gyro_spikes = self.gyro_enc.encode(gyro_corr, dt)   # (24,)
+        acc_spikes  = self.acc_enc.encode(accel_raw,  dt)   # (18,)
+
+        # ── Synaptic current to integrator neurons ─────────────────────────
+        I_gyro = self.W_gyro @ gyro_spikes               # (3,)
+        I_acc  = self.W_acc  @ acc_spikes * 0.3          # tilt correction
+        I_total = I_gyro + I_acc
+
+        # ── Integrator fire ────────────────────────────────────────────────
+        post_spikes = self.integrator.step(I_total, dt)   # (3,)
+
+        # ── STDP weight update ─────────────────────────────────────────────
+        self._stdp_update(gyro_spikes, post_spikes, dt)
+
+        # ── Orientation integration ────────────────────────────────────────
+        # Decode gyro rate from spikes, integrate to angle
+        omega_decoded = self.gyro_enc.decode(gyro_spikes)  # rad/s estimate
+        self.orientation += omega_decoded * dt
+
+        # Accel tilt correction for roll & pitch (complementary filter style)
+        acc_dec = self.acc_enc.decode(acc_spikes)
+        a_norm = np.linalg.norm(acc_dec)
+        if a_norm > 0.5:
+            roll_acc  = np.arctan2(acc_dec[1], acc_dec[2])
+            pitch_acc = np.arctan2(-acc_dec[0],
+                                   np.sqrt(acc_dec[1]**2 + acc_dec[2]**2))
+            alpha = 0.02   # complementary filter coefficient (trust accel 2%)
+            self.orientation[0] = (1-alpha)*self.orientation[0] + alpha*roll_acc
+            self.orientation[1] = (1-alpha)*self.orientation[1] + alpha*pitch_acc
+
+        # Wrap to [-π, π]
+        self.orientation = (self.orientation + np.pi) % (2*np.pi) - np.pi
+        return self.orientation.copy(), gyro_spikes, acc_spikes, post_spikes
+
+    def _stdp_update(self, pre: np.ndarray, post: np.ndarray, dt: float):
+        """
+        STDP rule:
+          pre  fires before post → potentiate (strengthen weight)
+          post fires before pre  → depress    (weaken weight)
+        Uses exponential decay window.
+        """
+        t = self._t
+        for j in range(3):         # post neurons
+            if post[j] > 0:        # post fired
+                # Potentiate: all pre that fired recently
+                dt_pre = t - self._last_pre_t
+                dW = self.A_plus * np.exp(-dt_pre / self.tau_stdp)
+                self.W_gyro[j] += dW
+                self._last_post_t[j] = t
+            # Depression: post fired recently, pre fires now
+            for i in np.where(pre > 0)[0]:
+                if self._last_post_t[j] > 0:
+                    dt_post = t - self._last_post_t[j]
+                    dW = -self.A_minus * np.exp(-dt_post / self.tau_stdp)
+                    self.W_gyro[j, i] += dW
+
+        for i in np.where(pre > 0)[0]:
+            self._last_pre_t[i] = t
+
+        # Clip weights to [0, 0.5] to prevent explosion
+        self.W_gyro = np.clip(self.W_gyro, 0.0, 0.5)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  SNN Motion Classifier  (STATIC / SLOW / FAST)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SNNMotionClassifier:
+    """
+    3-class winner-take-all (WTA) SNN classifier.
+    Replaces the simple threshold ZUPT of previous pipelines.
+
+    Input neurons: gyro magnitude + accel variance → 12 encoder neurons
+    Output layer : 3 neurons with lateral inhibition
+        Neuron 0 → STATIC   (velocity = 0)
+        Neuron 1 → SLOW     (low-speed motion)
+        Neuron 2 → FAST     (high-speed / aggressive motion)
+
+    Lateral inhibition: when one output neuron fires, it suppresses the others.
+    This ensures only ONE class wins per timestep (WTA).
+    """
+    def __init__(self):
+        self.feature_enc = RateEncoder(n_channels=2, n_pop=6,
+                                       val_min=0.0, val_max=20.0,
+                                       max_rate=150.0)
+        # Output layer: 3 class neurons
+        self.output = LIFNeuron(3, tau=0.015, v_thresh=0.7,
+                                v_reset=-0.1, t_ref=0.003)
+
+        # Weights: feature (12) → output (3)
+        self.W = np.array([
+            # STATIC: responds strongly to near-zero gyro + low accel var
+            [0.4, 0.3, 0.15, 0.05, 0.01, 0.0,   # gyro mag features
+             0.4, 0.3, 0.15, 0.05, 0.01, 0.0],  # accel var features
+            # SLOW: mid-range response
+            [0.0, 0.1, 0.3, 0.3, 0.2,  0.05,
+             0.0, 0.1, 0.3, 0.3, 0.2,  0.05],
+            # FAST: high gyro/accel
+            [0.0, 0.0, 0.05, 0.15, 0.35, 0.45,
+             0.0, 0.0, 0.05, 0.15, 0.35, 0.45],
+        ])
+
+        # Lateral inhibition weights (off-diagonal)
+        self.W_inh = 0.6 * (np.ones((3,3)) - np.eye(3))
+
+        self._gyro_buf  = []
+        self._accel_buf = []
+        self._window    = 12
+        self._state_hist = []       # for plotting
+        self._LABELS = ["STATIC","SLOW","FAST"]
+
+    def step(self, gyro_corr: np.ndarray,
+             accel_raw: np.ndarray, dt: float) -> int:
+        gm = float(np.linalg.norm(gyro_corr))
+
+        self._gyro_buf.append(gyro_corr.copy())
+        self._accel_buf.append(accel_raw.copy())
+        if len(self._gyro_buf) > self._window:
+            self._gyro_buf.pop(0); self._accel_buf.pop(0)
+
+        accel_var = float(np.var(np.array(self._accel_buf)))
+        features  = np.array([gm, accel_var])
+
+        spikes_in = self.feature_enc.encode(features, dt)   # (12,)
+        I_exc = self.W @ spikes_in                           # (3,) excitation
+
+        # Lateral inhibition from last step's output membrane potential
+        I_inh = self.W_inh @ (self.output.V - self.output.rest)
+        I_total = I_exc - np.maximum(0, I_inh)
+
+        out_spikes = self.output.step(I_total, dt)
+
+        # Winner = neuron with highest membrane potential
+        winner = int(np.argmax(self.output.V))
+        self._state_hist.append(winner)
+        return winner, out_spikes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  SNN Velocity & Position Integrator
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SNNIntegrator:
+    """
+    Spike-weighted numerical integrator.
+
+    Instead of integrating raw float acceleration, we:
+      1. Encode world-frame accel as spike train
+      2. Weight each spike by the decoded acceleration value
+      3. Accumulate into velocity, then position
+
+    The SNN motion-class gating replaces ZUPT:
+      STATIC → velocity reset (no integration)
+      SLOW   → half-weight integration (conservative)
+      FAST   → full integration
+
+    This makes drift correction a *learned, neural* decision rather than
+    a hard threshold.
+    """
+    def __init__(self):
+        self.acc_enc = RateEncoder(n_channels=3, n_pop=6,
+                                   val_min=-15.0, val_max=15.0)
+        self.vel = np.zeros(3)
+        self.pos = np.zeros(3)
+
+    def step(self, a_world: np.ndarray, motion_class: int, dt: float):
+        spikes  = self.acc_enc.encode(a_world, dt)
+        a_dec   = self.acc_enc.decode(spikes)     # spike-decoded acceleration
+
+        # Motion-class gating
+        if motion_class == 0:         # STATIC
+            self.vel[:] = 0.0
+            a_eff = np.zeros(3)
+        elif motion_class == 1:       # SLOW — conservative integration
+            a_eff = a_dec * 0.4
+        else:                         # FAST — full integration
+            a_eff = a_dec
+
+        self.vel += a_eff * dt
+        self.pos += self.vel * dt
+        return self.pos.copy(), self.vel.copy(), spikes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  STDP-Based Bias Estimator
+# ══════════════════════════════════════════════════════════════════════════════
+
+class STDPBiasEstimator:
+    """
+    Uses STDP to online-learn the gyro and accel bias.
+
+    Concept:
+      A pair of neurons is assigned to each bias dimension (6 total).
+      Neuron A encodes the running mean of the signal during static windows.
+      STDP correlates Neuron A's spikes with the STATIC gate signal.
+      The learned weight converges to the bias value.
+
+    In practice this gives a slow, noise-robust bias estimate that improves
+    throughout the recording — unlike the one-shot static-window estimate.
+    """
+    def __init__(self, n_dims: int = 6,
+                 learning_rate: float = 0.001,
+                 decay: float = 0.9998):
+        self.n   = n_dims
+        self.lr  = learning_rate
+        self.decay = decay
+        self.bias_estimate = np.zeros(n_dims)
+        self._running_sum  = np.zeros(n_dims)
+        self._count        = 0
+        self._weights      = np.zeros(n_dims)   # STDP-converged weights
+
+    def update(self, signal: np.ndarray, is_static: bool, dt: float):
+        """
+        signal : [gyro_corr(3), accel_corr(3)]
+        """
+        # During static windows: Hebbian potentiation → weight tracks signal
+        if is_static:
+            self._running_sum += signal
+            self._count += 1
+            # STDP: pre (signal) and post (static gate) are correlated
+            err = signal - self._weights
+            self._weights += self.lr * err
+
+        # Slow decay ensures old estimates don't dominate
+        self._weights *= self.decay
+        self.bias_estimate = self._weights.copy()
+        return self.bias_estimate
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  Full SNN SLAM Pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SNNSLAMPipeline:
+    def __init__(self, n_static: int = 200):
+        self.n_static = n_static
+        self.orient_net  = SNNOrientationNetwork()
+        self.classifier  = SNNMotionClassifier()
+        self.integrator  = SNNIntegrator()
+        self.bias_est    = STDPBiasEstimator(n_dims=6)
+
+    def _static_init(self, data):
+        static = data[:self.n_static]
+        gyro_bias  = static[:, 1:4].mean(axis=0)
+        accel_mean = static[:, 4:7].mean(axis=0)
+        g_mag = np.linalg.norm(accel_mean)
+        roll  = np.arctan2(accel_mean[1], accel_mean[2])
+        pitch = np.arctan2(-accel_mean[0],
+                           np.sqrt(accel_mean[1]**2 + accel_mean[2]**2))
+        accel_bias = accel_mean - g_mag * np.array([
+            -np.sin(pitch),
+             np.cos(pitch)*np.sin(roll),
+             np.cos(pitch)*np.cos(roll)])
+
+        self.orient_net.orientation = np.array([roll, pitch, 0.0])
+        return gyro_bias, accel_bias
+
+    def run(self, data: np.ndarray):
+        N  = len(data)
+        ts = data[:, 0]
+
+        gyro_bias, accel_bias = self._static_init(data)
+        g_world = np.array([0., 0., GRAVITY])
+        print(f"[INIT]  Gyro bias  : {gyro_bias}")
+        print(f"[INIT]  Accel bias : {accel_bias}")
+
+        # Output buffers
+        pos_h    = np.zeros((N, 3))
+        vel_h    = np.zeros((N, 3))
+        euler_h  = np.zeros((N, 3))
+        class_h  = np.zeros(N, dtype=int)
+        gbias_h  = np.zeros((N, 3))
+        abias_h  = np.zeros((N, 3))
+        # Spike rasters (store 18 orientation-layer spikes for visualisation)
+        raster_gyro = np.zeros((N, 24))
+        raster_out  = np.zeros((N, 3))
+        mem_pot     = np.zeros((N, 3))
+
+        for i in range(N):
+            dt = float(ts[i]-ts[i-1]) if i > 0 else DT_SIM
+            dt = np.clip(dt, 1e-4, 0.05)
+
+            gyro_raw  = data[i, 1:4]
+            accel_raw = data[i, 4:7]
+            gyro_corr = gyro_raw  - gyro_bias
+            accel_corr= accel_raw - accel_bias
+
+            # ── SNN orientation network ───────────────────────────────────
+            euler, g_spikes, a_spikes, o_spikes = \
+                self.orient_net.step(gyro_raw, accel_raw, gyro_bias, dt)
+            euler_h[i] = euler
+
+            # ── SNN motion classifier ─────────────────────────────────────
+            motion_class, cls_spikes = \
+                self.classifier.step(gyro_corr, accel_raw, dt)
+            class_h[i] = motion_class
+
+            # ── STDP bias estimator ───────────────────────────────────────
+            is_static = (motion_class == 0)
+            signal6   = np.concatenate([gyro_corr, accel_corr])
+            bias6     = self.bias_est.update(signal6, is_static, dt)
+            gbias_h[i] = bias6[:3];  abias_h[i] = bias6[3:]
+
+            # ── Rotation matrix from SNN-estimated euler ──────────────────
+            r, p, y = euler
+            cr,sr = np.cos(r),np.sin(r)
+            cp,sp = np.cos(p),np.sin(p)
+            cy,sy = np.cos(y),np.sin(y)
+            Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
+            Ry = np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
+            Rz = np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
+            R  = Rz @ Ry @ Rx
+
+            # ── World-frame linear acceleration ───────────────────────────
+            a_world = R @ accel_raw - g_world
+
+            # ── SNN integrator ────────────────────────────────────────────
+            pos, vel, int_spikes = \
+                self.integrator.step(a_world, motion_class, dt)
+            pos_h[i] = pos;  vel_h[i] = vel
+
+            # ── Save spike rasters ────────────────────────────────────────
+            raster_gyro[i] = g_spikes
+            raster_out[i]  = o_spikes
+            mem_pot[i]     = self.orient_net.integrator.V.copy()
+
+        n_static = int((class_h == 0).sum())
+        print(f"[DONE]  {N} samples | {ts[-1]-ts[0]:.2f}s")
+        print(f"[SNN]   STATIC : {n_static}  ({100*n_static/N:.1f}%)")
+        print(f"[SNN]   SLOW   : {int((class_h==1).sum())}  "
+              f"({100*(class_h==1).mean():.1f}%)")
+        print(f"[SNN]   FAST   : {int((class_h==2).sum())}  "
+              f"({100*(class_h==2).mean():.1f}%)")
+        print(f"[TRAJ]  Final pos (m): {pos_h[-1]}")
+
+        return dict(
+            ts=ts, pos=pos_h, vel=vel_h, euler=euler_h,
+            classes=class_h, gbias=gbias_h, abias=abias_h,
+            raster_gyro=raster_gyro, raster_out=raster_out,
+            mem_pot=mem_pot, raw=data
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  Visualisation — 16-panel SNN dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_snn(res, save_path=None):
+    ts    = res["ts"] - res["ts"][0]
+    pos   = res["pos"];  vel   = res["vel"]
+    euler = res["euler"]
+    roll  = np.degrees(euler[:,0])
+    pitch = np.degrees(euler[:,1])
+    yaw   = np.degrees(euler[:,2])
+    cls   = res["classes"]
+    raw   = res["raw"]
+    rg    = res["raster_gyro"]
+    ro    = res["raster_out"]
+    mp    = res["mem_pot"]
+    vmag  = np.linalg.norm(vel, axis=1)
+    amag  = np.linalg.norm(raw[:,4:7], axis=1)
+    gm    = np.linalg.norm(raw[:,1:4], axis=1)
+
+    plt.rcParams.update({
+        "figure.facecolor":"#070910","axes.facecolor":"#0c0f18",
+        "axes.edgecolor":"#1e2233","axes.labelcolor":"#a8b4cc",
+        "xtick.color":"#485068","ytick.color":"#485068",
+        "text.color":"#a8b4cc","grid.color":"#141828",
+        "grid.linewidth":0.45,"lines.linewidth":1.2,
+        "font.family":"monospace","font.size":7.5,
+    })
+
+    C = dict(x="#00d8ff", y="#39ff14", z="#ff8c42",
+             mag="#ffd700", s0="#80ff80", s1="#ffaa00", s2="#ff4466",
+             sp="#b070ff", mem="#ff88cc", lc="#ff50a0")
+
+    CLASS_COLOR = [C["s0"], C["s1"], C["s2"]]
+    CLASS_LABEL = ["STATIC","SLOW","FAST"]
+
+    fig = plt.figure(figsize=(26, 20))
+    fig.suptitle(
+        "Spiking Neural Network (SNN) IMU SLAM Pipeline  —  "
+        "LIF Neurons · Rate Coding · STDP · WTA Classifier",
+        fontsize=15, fontweight="bold", color="#dde2f4", y=0.985)
+    gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.55, wspace=0.38)
+
+    def mkax(r, c, title, proj=None):
+        a = fig.add_subplot(gs[r,c], projection=proj) if proj \
+            else fig.add_subplot(gs[r,c])
+        a.set_title(title, color="#4e6080", fontsize=7.5, pad=3)
+        if not proj: a.grid(True, alpha=0.3)
+        return a
+
+    # ── Row 0: raw signals ───────────────────────────────────────────────────
+    a00 = mkax(0,0,"Raw Gyroscope  (rad/s)")
+    a00.plot(ts, raw[:,1], C["x"], label="ωx", alpha=.8)
+    a00.plot(ts, raw[:,2], C["y"], label="ωy", alpha=.8)
+    a00.plot(ts, raw[:,3], C["z"], label="ωz", alpha=.8)
+    a00.legend(fontsize=6); a00.set_xlabel("t(s)")
+
+    a01 = mkax(0,1,"Raw Accelerometer  (m/s²)")
+    a01.plot(ts, raw[:,4], C["x"], label="ax", alpha=.8)
+    a01.plot(ts, raw[:,5], C["y"], label="ay", alpha=.8)
+    a01.plot(ts, raw[:,6], C["z"], label="az", alpha=.8)
+    a01.legend(fontsize=6); a01.set_xlabel("t(s)")
+
+    a02 = mkax(0,2,"|Accel| & |Gyro| magnitude")
+    a02.plot(ts, amag, C["mag"], lw=1.2, label="|accel|")
+    a02.axhline(GRAVITY, color=C["s2"], ls="--", lw=0.8, label="g")
+    ax2b = a02.twinx()
+    ax2b.plot(ts, gm, C["sp"], lw=0.9, alpha=.6, label="|ω|")
+    ax2b.set_ylabel("|ω| (rad/s)", color=C["sp"], fontsize=7)
+    ax2b.tick_params(colors=C["sp"])
+    a02.legend(fontsize=6, loc="upper left"); a02.set_xlabel("t(s)")
+
+    a03 = mkax(0,3,"SNN Motion Class  (WTA output)")
+    c_colors = np.array([CLASS_COLOR[int(c)] for c in cls])
+    for ci, (label, color) in enumerate(zip(CLASS_LABEL, CLASS_COLOR)):
+        mask = cls == ci
+        if mask.any():
+            a03.fill_between(ts, ci-0.4, ci+0.4,
+                             where=mask, color=color, alpha=0.7, label=label)
+    a03.set_yticks([0,1,2]); a03.set_yticklabels(CLASS_LABEL, fontsize=7)
+    a03.set_xlabel("t(s)"); a03.legend(fontsize=6, loc="upper right")
+    a03.set_ylim(-0.6, 2.6)
+
+    # ── Row 1: spike rasters ─────────────────────────────────────────────────
+    a10 = mkax(1,0,"Spike Raster — Gyro encoder neurons  (24 neurons)")
+    # Plot as event plot (show only subset of timesteps for clarity)
+    step = max(1, len(ts)//500)
+    ts_sub = ts[::step]
+    rg_sub = rg[::step]
+    for nrn in range(min(24, rg_sub.shape[1])):
+        spike_t = ts_sub[rg_sub[:, nrn] > 0]
+        if len(spike_t):
+            a10.scatter(spike_t, np.full(len(spike_t), nrn),
+                       marker="|", s=4, c=C["sp"], alpha=0.5, linewidths=0.5)
+    a10.set_ylabel("Neuron #"); a10.set_xlabel("t(s)")
+    a10.set_ylim(-1, 24)
+
+    a11 = mkax(1,1,"Spike Raster — Orientation integrator  (3 neurons)")
+    COLORS_3 = [C["x"], C["y"], C["z"]]
+    LABELS_3 = ["Roll nrn","Pitch nrn","Yaw nrn"]
+    ro_sub = ro[::step]
+    for nrn in range(3):
+        spike_t = ts_sub[ro_sub[:, nrn] > 0]
+        if len(spike_t):
+            a11.scatter(spike_t, np.full(len(spike_t), nrn),
+                       marker="|", s=8, c=COLORS_3[nrn],
+                       alpha=0.7, linewidths=0.8, label=LABELS_3[nrn])
+    a11.set_yticks([0,1,2]); a11.set_yticklabels(LABELS_3, fontsize=7)
+    a11.legend(fontsize=6); a11.set_xlabel("t(s)")
+    a11.set_ylim(-0.5, 2.5)
+
+    a12 = mkax(1,2,"Membrane potential — integrator neurons")
+    a12.plot(ts, mp[:,0], C["x"], label="V_roll",  alpha=.85)
+    a12.plot(ts, mp[:,1], C["y"], label="V_pitch", alpha=.85)
+    a12.plot(ts, mp[:,2], C["z"], label="V_yaw",   alpha=.85)
+    a12.axhline(0.8, color=C["mem"], ls="--", lw=0.8, label="threshold")
+    a12.legend(fontsize=6); a12.set_xlabel("t(s)")
+    a12.set_ylabel("V (a.u.)")
+
+    a13 = mkax(1,3,"STDP gyro bias estimate  (rad/s)")
+    a13.plot(ts, res["gbias"][:,0], C["x"], label="bg_x")
+    a13.plot(ts, res["gbias"][:,1], C["y"], label="bg_y")
+    a13.plot(ts, res["gbias"][:,2], C["z"], label="bg_z")
+    a13.legend(fontsize=6); a13.set_xlabel("t(s)")
+    a13.set_ylabel("bias (rad/s)")
+
+    # ── Row 2: orientation, velocity, position ───────────────────────────────
+    a20 = mkax(2,0,"SNN Orientation — Roll/Pitch/Yaw  (°)")
+    a20.plot(ts, roll,  C["x"], label="Roll")
+    a20.plot(ts, pitch, C["y"], label="Pitch")
+    a20.plot(ts, yaw,   C["z"], label="Yaw")
+    a20.legend(fontsize=6); a20.set_xlabel("t(s)")
+
+    a21 = mkax(2,1,"SNN Velocity  (m/s)")
+    a21.plot(ts, vel[:,0], C["x"], label="Vx", alpha=.8)
+    a21.plot(ts, vel[:,1], C["y"], label="Vy", alpha=.8)
+    a21.plot(ts, vel[:,2], C["z"], label="Vz", alpha=.8)
+    a21.plot(ts, vmag,     C["mag"], label="|V|", lw=1.8)
+    static_mask = cls == 0
+    a21.fill_between(ts, 0, vmag.max()*static_mask,
+                     alpha=.2, color=C["s0"], label="STATIC gate")
+    a21.legend(fontsize=6); a21.set_xlabel("t(s)")
+
+    a22 = mkax(2,2,"SNN Position  (m)")
+    a22.plot(ts, pos[:,0], C["x"], label="X")
+    a22.plot(ts, pos[:,1], C["y"], label="Y")
+    a22.plot(ts, pos[:,2], C["z"], label="Z")
+    a22.legend(fontsize=6); a22.set_xlabel("t(s)")
+
+    a23 = mkax(2,3,"STDP accel bias estimate  (m/s²)")
+    a23.plot(ts, res["abias"][:,0], C["x"], label="ba_x")
+    a23.plot(ts, res["abias"][:,1], C["y"], label="ba_y")
+    a23.plot(ts, res["abias"][:,2], C["z"], label="ba_z")
+    a23.legend(fontsize=6); a23.set_xlabel("t(s)")
+    a23.set_ylabel("bias (m/s²)")
+
+    # ── Row 3: trajectories + stats ──────────────────────────────────────────
+    a30 = mkax(3,0,"2D Trajectory  X–Y")
+    # Colour points by motion class
+    for ci, color in enumerate(CLASS_COLOR):
+        mask = cls == ci
+        if mask.any():
+            a30.scatter(pos[mask,0], pos[mask,1], c=color,
+                       s=2, alpha=.7, label=CLASS_LABEL[ci])
+    a30.plot(*pos[0,:2],  "o", color=C["y"],  ms=9, zorder=5, label="Start")
+    a30.plot(*pos[-1,:2], "*", color=C["z"],  ms=13, zorder=5, label="End")
+    a30.set_aspect("equal","datalim")
+    a30.legend(fontsize=6, markerscale=2)
+    a30.set_xlabel("X(m)"); a30.set_ylabel("Y(m)")
+
+    a31 = mkax(3,1,"2D Trajectory  X–Z")
+    sc2 = a31.scatter(pos[:,0], pos[:,2], c=ts, cmap="viridis", s=2, alpha=.8)
+    plt.colorbar(sc2, ax=a31, label="t(s)", pad=0.02)
+    a31.set_aspect("equal","datalim")
+    a31.set_xlabel("X(m)"); a31.set_ylabel("Z(m)")
+
+    a32 = mkax(3,2,"3D Trajectory (coloured by motion class)", proj="3d")
+    a32.set_facecolor("#0c0f18")
+    n = len(pos); step3 = max(1, n//300)
+    for ci, color in enumerate(CLASS_COLOR):
+        mask = np.where(cls[::step3] == ci)[0]
+        idxs = mask * step3
+        idxs = idxs[idxs < n]
+        if len(idxs):
+            a32.scatter(pos[idxs,0], pos[idxs,1], pos[idxs,2],
+                       c=color, s=2, alpha=.7, label=CLASS_LABEL[ci])
+    a32.scatter(*pos[0],  color=C["y"], s=50, zorder=6)
+    a32.scatter(*pos[-1], color=C["z"], s=80, marker="*", zorder=6)
+    a32.set_title("3D Trajectory", color="#4e6080", fontsize=7.5, pad=4)
+    a32.set_xlabel("X",fontsize=7); a32.set_ylabel("Y",fontsize=7)
+    a32.set_zlabel("Z",fontsize=7)
+    a32.tick_params(colors="#485068", labelsize=6)
+    a32.legend(fontsize=6)
+
+    # Stats panel
+    a33 = mkax(3,3,"SNN Architecture Report")
+    a33.axis("off")
+    n_static_f = int((cls==0).sum())
+    n_slow_f   = int((cls==1).sum())
+    n_fast_f   = int((cls==2).sum())
+    report = (
+        f"  ╔══ SNN SLAM Report ═══════════════╗\n"
+        f"  ║ Neuron model  : LIF (Leaky I&F)\n"
+        f"  ║ Encoding      : Gaussian pop. rate\n"
+        f"  ║ Learning      : STDP (online)\n"
+        f"  ║ Classifier    : WTA lateral inhib.\n"
+        f"  ╠════════════════════════════════╣\n"
+        f"  ║ Duration      : {ts[-1]:.2f} s\n"
+        f"  ║ Samples       : {len(ts)}\n"
+        f"  ║ Rate          : {1/np.mean(np.diff(ts)):.1f} Hz\n"
+        f"  ╠════════════════════════════════╣\n"
+        f"  ║ STATIC frames : {n_static_f} ({100*n_static_f/len(ts):.1f}%)\n"
+        f"  ║ SLOW frames   : {n_slow_f} ({100*n_slow_f/len(ts):.1f}%)\n"
+        f"  ║ FAST frames   : {n_fast_f} ({100*n_fast_f/len(ts):.1f}%)\n"
+        f"  ╠════════════════════════════════╣\n"
+        f"  ║ Gyro enc nrns : 3 ch × 8 pop = 24\n"
+        f"  ║ Accel enc nrns: 3 ch × 6 pop = 18\n"
+        f"  ║ Orient intgr  : 3 LIF neurons\n"
+        f"  ║ Classifier    : 2×6 enc + 3 WTA\n"
+        f"  ╠════════════════════════════════╣\n"
+        f"  ║ Peak speed    : {vmag.max():.3f} m/s\n"
+        f"  ║ Final X       : {pos[-1,0]:.3f} m\n"
+        f"  ║ Final Y       : {pos[-1,1]:.3f} m\n"
+        f"  ║ Final Z       : {pos[-1,2]:.3f} m\n"
+        f"  ╚════════════════════════════════╝\n"
+    )
+    a33.text(0.02, 0.98, report, transform=a33.transAxes,
+             fontsize=7.2, verticalalignment="top",
+             fontfamily="monospace", color="#88aab8",
+             bbox=dict(facecolor="#121828", edgecolor="#2a3050",
+                       boxstyle="round,pad=0.5"))
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"[PLOT]  Saved → {save_path}")
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Synthetic IMU Generator
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_synthetic_imu(duration=30.0, hz=200, seed=0):
+    np.random.seed(seed)
+    dt = 1.0/hz; N = int(duration*hz)
+    ts = np.arange(N)*dt
+
+    roll0=np.radians(65.0); pitch0=np.radians(5.0)
+    g_body = np.array([
+        -np.sin(pitch0),
+         np.sin(roll0)*np.cos(pitch0),
+         np.cos(roll0)*np.cos(pitch0)]) * GRAVITY
+
+    gx=np.zeros(N); gy=np.zeros(N); gz=np.zeros(N)
+    ax=np.full(N,g_body[0])
+    ay=np.full(N,g_body[1])
+    az=np.full(N,g_body[2])
+
+    # Walk phases
+    s=lambda t: int(t*hz)
+    ax[s(2.5):s(2.5)+40] += 0.6   # forward push
+    ax[s(7.5):s(7.5)+40] -= 0.6   # brake
+    gz[s(8):s(12)] += 0.25         # turn left
+    ax[s(12.5):s(12.5)+40] += 0.5
+    ax[s(22):s(22)+40] -= 0.5
+
+    noise_g=0.003; noise_a=0.04
+    gx += np.random.randn(N)*noise_g + 0.0012
+    gy += np.random.randn(N)*noise_g - 0.0010
+    gz += np.random.randn(N)*noise_g + 0.0011
+    ax += np.random.randn(N)*noise_a
+    ay += np.random.randn(N)*noise_a
+    az += np.random.randn(N)*noise_a
+
+    return np.column_stack([ts,gx,gy,gz,ax,ay,az])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    imu_path = "imu.txt"
+    out_png  = "imu_snn_result_numpy.png"
+    out_csv  = "imu_snn_trajectory_numpy.csv"
+
+    print("="*60)
+    print("  SNN IMU SLAM  —  Spiking Neural Network Pipeline")
+    print("="*60)
+
+    if Path(imu_path).exists():
+        data = np.loadtxt(imu_path, comments="#")
+        print(f"[LOAD]  {data.shape[0]} samples from '{imu_path}'")
+    else:
+        print(f"[WARN]  '{imu_path}' not found — generating synthetic data")
+        data = generate_synthetic_imu(duration=30.0, hz=200)
+        print(f"[SYN]   {data.shape[0]} samples generated")
+
+    pipeline = SNNSLAMPipeline(n_static=200)
+    res = pipeline.run(data)
+
+    # CSV export
+    t_rel = res["ts"] - res["ts"][0]
+    out = np.column_stack([
+        t_rel, res["pos"], res["vel"],
+        np.degrees(res["euler"]),
+        res["classes"],
+        res["gbias"], res["abias"],
+    ])
+    hdr = ("time_s,x,y,z,vx,vy,vz,"
+           "roll_deg,pitch_deg,yaw_deg,"
+           "motion_class,"
+           "gbx,gby,gbz,abx,aby,abz")
+    np.savetxt(out_csv, out, delimiter=",", header=hdr, comments="")
+    print(f"[CSV]   Saved → {out_csv}")
+
+    plot_snn(res, save_path=out_png)
+
+if __name__ == "__main__":
+    main()
+
+print('Re-running SNN pipeline to generate trajectory...')
+# Re-create the data generation and pipeline execution from the main function
+
+data = generate_synthetic_imu(duration=30.0, hz=200)
+pipeline = SNNSLAMPipeline(n_static=200)
+res = pipeline.run(data)
+
+print('Displaying 3D trajectory...')
+# Call the plot_snn function to display the 3D trajectory
+# We pass save_path=None to display the plot directly in the notebook
+plot_snn(res, save_path=None)
